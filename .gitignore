@@ -1,0 +1,24 @@
+# Dependency and build output
+node_modules/
+dist/
+build/
+coverage/
+*.tsbuildinfo
+
+# Local configuration
+.env
+.env.*
+!.env.example
+
+# Personal data and runtime artifacts
+/data/*
+!/data/README.md
+/var/*
+!/var/README.md
+*.log
+
+# Editor and operating system files
+.DS_Store
+Thumbs.db
+.idea/
+

@@ -1,0 +1,7 @@
+{
+  "name": "@anima/npc-core",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "人格、私有记忆、关系认知与决策核心"
+}

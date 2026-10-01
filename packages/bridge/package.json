@@ -1,0 +1,7 @@
+{
+  "name": "@anima/bridge",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "NPC 与世界之间的消息交付和结果回执"
+}

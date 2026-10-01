@@ -1,0 +1,7 @@
+{
+  "name": "@anima/protocol",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "NPC 与世界之间的共享数据契约"
+}

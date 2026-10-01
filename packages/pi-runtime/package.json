@@ -1,0 +1,11 @@
+{
+  "name": "@anima/pi-runtime",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "pi 的模型运行与工具循环适配",
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "0.84.2",
+    "@earendil-works/pi-ai": "0.84.2"
+  }
+}

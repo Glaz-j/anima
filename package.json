@@ -1,0 +1,17 @@
+{
+  "name": "anima",
+  "version": "0.0.0",
+  "private": true,
+  "description": "栖灵 · Anima — 模拟人格与可替换世界之间的运行系统",
+  "type": "module",
+  "scripts": {
+    "example:pi": "node --env-file-if-exists=.env packages/pi-runtime/examples/npc.ts"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ]
+}
