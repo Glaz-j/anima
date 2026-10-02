@@ -12,6 +12,10 @@ window.AnimaViewerStart = ({ THREE, TWEEN, Viewer, Vec3, io }) => {
   let status, failed = false, disposed = false, renderer, viewer, controls, orbitCamera, socket, frame, generation = -1;
   let viewCleanup = [];
   const pageCleanup = [];
+  let parentVisible = true;
+  const visible = () => parentVisible && !document.hidden;
+  let lastFrameAt = Date.now(), resumeUntil = 0;
+  const resume = () => { loadingAt = lastFrameAt = Date.now(); resumeUntil = lastFrameAt + 5000; lastPostedAt = 0; };
   let hasPosition = false, worldReady = false, chunkCount = 0, lastPositionAt = 0, loadingAt = Date.now();
   let lastPostedAt = 0, positionRevision = 0, lastLivePositionRevision = -1;
   let lastCollisionAt = -Infinity, safeCameraDistance = Infinity;
@@ -132,10 +136,20 @@ window.AnimaViewerStart = ({ THREE, TWEEN, Viewer, Vec3, io }) => {
     listen(window, 'error', event => fail('画面渲染错误：' + errorDetail(event.error || event.message)));
     listen(window, 'unhandledrejection', event => fail('画面异步错误：' + errorDetail(event.reason)));
     listen(window, 'message', event => {
-      if (event.source === window.parent && event.origin === parentOrigin && event.data?.type === 'anima-viewer-dispose'
-        && event.data.npc === npc && event.data.sessionId === sessionId) dispose();
+      const data = event.data;
+      if (event.source !== window.parent || event.origin !== parentOrigin || data?.npc !== npc || data.sessionId !== sessionId) return;
+      if (data.type === 'anima-viewer-dispose') dispose();
+      else if (data.type === 'anima-viewer-visibility' && typeof data.visible === 'boolean') {
+        if (data.visible) resume();
+        parentVisible = data.visible;
+      }
     });
     listen(window, 'pagehide', dispose);
+    listen(document, 'visibilitychange', () => {
+      // Hidden documents may stop animation entirely. Time spent suspended is
+      // not a failed load; on return, allow fresh packets and frames to arrive.
+      if (visible()) resume();
+    });
     socket = io({ auth: { npc }, transports: ['websocket'], reconnectionDelay: 1000, timeout: 8000 });
     const target = new THREE.Vector3();
     socket.on('connect', () => report('loading'));
@@ -199,6 +213,9 @@ window.AnimaViewerStart = ({ THREE, TWEEN, Viewer, Vec3, io }) => {
     function animate() {
       frame = undefined;
       if (disposed || failed || !viewer) return;
+      if (!visible()) { frame = requestAnimationFrame(animate); return; }
+      if (Date.now() - lastFrameAt > 5000) resume();
+      lastFrameAt = Date.now();
       try {
       if (hasPosition) {
         // Translate camera and orbit centre together; preserve the user's orbit/zoom.
@@ -206,8 +223,11 @@ window.AnimaViewerStart = ({ THREE, TWEEN, Viewer, Vec3, io }) => {
       }
       controls.update(); if (hasPosition) positionCamera(); viewer.update(); renderer.render(viewer.scene, viewer.camera);
       const fresh = hasPosition && Date.now() - lastPositionAt < 5000;
-      if (!failed && worldReady && chunkCount > 0 && fresh && viewer.world.sectionsOutstanding.size === 0) report('live');
-      else if (status === 'live' && !fresh) report('disconnected', '等待新的角色位置…');
+      // Moving NPCs continuously dirty sections. A real rendered terrain mesh
+      // is enough to present the scene while the remaining chunks stream in.
+      const terrainReady = viewer.world.sectionsOutstanding.size === 0 || Object.values(viewer.world.sectionMeshs || {}).some(mesh => mesh.geometry?.attributes?.position?.count > 0);
+      if (!failed && worldReady && chunkCount > 0 && fresh && terrainReady) report('live');
+      else if (status === 'live' && !fresh && Date.now() >= resumeUntil) report('disconnected', '等待新的角色位置…');
       else if (!failed && status === 'loading' && Date.now() - loadingAt > 20000) fail('真实区块尚未完成渲染，请重连画面。');
       } catch (error) { fail('画面渲染错误：' + errorDetail(error)); }
       // Schedule after rendering: a fatal renderer error cannot repeat per frame.

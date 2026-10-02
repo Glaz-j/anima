@@ -9,6 +9,7 @@ let token, sessionPromise, refreshBusy = false, operationBusy = false, experimen
 let currentBots = [], currentExperiment = {}, observations = new Map();
 let experience = {}, playBusy = false;
 const camera = new CameraSession({
+  visible: document.visibilityState !== 'hidden',
   onState: cameraState,
   mount(url, npc) {
     // Replacing the browsing context avoids a stalled navigation retaining the old
@@ -61,6 +62,18 @@ function renderPlay() {
   $('play-address').textContent = play?.serverAddress || experience.serverAddress || '127.0.0.1:25565';
 }
 window.addEventListener('message', event => camera.receive(event));
+let cameraIntersects = true;
+const syncCameraVisibility = () => camera.setVisible(document.visibilityState !== 'hidden' && cameraIntersects);
+document.addEventListener('visibilitychange', syncCameraVisibility);
+// Chromium can throttle an offscreen cross-origin iframe independently of the
+// parent document. Keep that pause out of the camera's connection watchdog.
+const cameraVisibility = new IntersectionObserver(entries => {
+  const entry = entries.find(item => item.target === $('viewport'));
+  if (!entry) return;
+  cameraIntersects = entry.isIntersecting && entry.intersectionRatio > 0;
+  syncCameraVisibility();
+});
+cameraVisibility.observe($('viewport'));
 window.addEventListener('pagehide', () => camera.release());
 
 async function renewSession() {

@@ -157,7 +157,7 @@ test('pinned bundle entry replacement is fail-closed and preserves height patche
 test('third-person client follows real motion and cleans up scoped workers, async assets and WebGL on an authenticated dispose', async () => {
   const source = await readFile(new URL('../adapters/minecraft/viewer/viewer-client.js', import.meta.url), 'utf8');
   const THREE = require('three'); const socket = new EventEmitter(); (socket as any).disconnect = () => socket.emit('disconnect');
-  const messages: any[] = [], callbacks: any = {}, frames: (() => void)[] = [], textureLoads: any[] = [], fetches: any[] = [];
+  const messages: any[] = [], callbacks: any = {}, documentCallbacks: any = {}, frames: (() => void)[] = [], textureLoads: any[] = [], fetches: any[] = [];
   let view: any, control: any, disposed = 0, contextLoss = 0, viewCount = 0, now = 1000, raycasts = 0, renderError = false;
   const fakeThree = { ...THREE, DefaultLoadingManager: {},
     WebGLRenderer: class { domElement = { addEventListener() {}, removeEventListener() {}, remove() {} }; setPixelRatio() {} setSize() {} render() { if (renderError) throw new Error('render fixture failure'); } dispose() { disposed++; } forceContextLoss() { contextLoss++; } },
@@ -179,7 +179,8 @@ test('third-person client follows real motion and cleans up scoped workers, asyn
   const label = { dataset: {}, textContent: '' };
   const window: any = { devicePixelRatio: 1, parent: { postMessage: (m: any, origin: string) => messages.push({ ...m, origin }) },
     addEventListener: (name: string, f: any) => { callbacks[name] = f; }, removeEventListener: (name: string) => { delete callbacks[name]; } };
-  const context = { window, location: { search: '?npc=Sheldon&sessionId=camera-123' }, document: { referrer: 'http://localhost:18791/',
+  const context = { window, location: { search: '?npc=Sheldon&sessionId=camera-123' }, document: { referrer: 'http://localhost:18791/', hidden: false,
+    addEventListener: (name: string, f: any) => { documentCallbacks[name] = f; }, removeEventListener: (name: string) => { delete documentCallbacks[name]; },
     querySelector: () => ({ content: '18791' }), getElementById: () => label, body: { appendChild() {} } },
     URL, URLSearchParams, AbortController, fetch: (url: string, options: any) => new Promise((resolve, reject) => { fetches.push({ url, options, resolve, reject }); }),
     innerWidth: 800, innerHeight: 600, requestAnimationFrame: (f: any) => { frames.push(f); return f; },
@@ -227,11 +228,53 @@ test('third-person client follows real motion and cleans up scoped workers, asyn
   assert.equal(frames.length, 0, 'fatal errors stop animation rather than throwing every frame');
   socket.emit('disconnect'); assert.equal(messages.at(-1).status, 'disconnected');
 
+  // A partially meshed but visible world stays live while the NPC dirties more
+  // sections; waiting for an empty global queue would suppress every heartbeat.
+  socket.emit('viewer-reset', { npc: 'Sheldon', generation: 1, version: '1.21.4' });
+  const terrain = new THREE.Mesh(new THREE.BoxGeometry(), new THREE.MeshBasicMaterial());
+  view.world.sectionMeshs.partial = terrain; view.world.sectionsOutstanding.add('still-meshing');
+  socket.emit('loadChunk', { x: 0, z: 0, chunk: '{}' }); socket.emit('viewer-world-ready', { generation: 1 });
+  for (let i = 0; i < 8; i++) {
+    now += 2100;
+    socket.emit('position', { npc: 'Sheldon', generation: 1, pos: { x: i, y: -20, z: 0 }, yaw: 0 });
+    const before = messages.length; frames.shift()!();
+    assert.equal(messages.length, before + 1); assert.equal(messages.at(-1).status, 'live');
+  }
+  const aliveViewCount = viewCount;
+  context.document.hidden = true; documentCallbacks.visibilitychange();
+  now += 300000; const hiddenMessages = messages.length; frames.shift()!();
+  assert.equal(messages.length, hiddenMessages, 'suspended animation is not a disconnect');
+  context.document.hidden = false; documentCallbacks.visibilitychange();
+  frames.shift()!(); assert.equal(messages.at(-1).status, 'live', 'resumed rendering allows fresh network packets to catch up');
+  socket.emit('position', { npc: 'Sheldon', generation: 1, pos: { x: 8, y: -20, z: 0 }, yaw: 0 });
+  frames.shift()!(); assert.equal(messages.at(-1).status, 'live'); assert.equal(viewCount, aliveViewCount);
+
+  // A cross-origin iframe scrolled off-screen may stop rAF even while its
+  // document remains visible. The validated parent visibility signal covers it.
+  const visibilityMessage = (visible: boolean) => ({ source: window.parent, origin: 'http://localhost:18791',
+    data: { type: 'anima-viewer-visibility', npc: 'Sheldon', sessionId: 'camera-123', visible } });
+  callbacks.message(visibilityMessage(false)); const offscreenMessages = messages.length;
+  now += 300000; frames.shift()!(); assert.equal(messages.length, offscreenMessages);
+  callbacks.message({ ...visibilityMessage(true), origin: 'http://unrelated.invalid' });
+  frames.shift()!(); assert.equal(messages.length, offscreenMessages, 'foreign pages cannot resume a paused view');
+  callbacks.message(visibilityMessage(true));
+  socket.emit('position', { npc: 'Sheldon', generation: 1, pos: { x: 9, y: -20, z: 0 }, yaw: 0 });
+  frames.shift()!(); assert.equal(messages.at(-1).status, 'live'); assert.equal(viewCount, aliveViewCount);
+
+  // Even a load suspended before its first frame gets its visible-time budget.
+  socket.emit('viewer-reset', { npc: 'Sheldon', generation: 1, version: '1.21.4' });
+  context.document.hidden = true; documentCallbacks.visibilitychange(); now += 300000; frames.shift()!();
+  context.document.hidden = false; documentCallbacks.visibilitychange(); frames.shift()!();
+  assert.equal(messages.at(-1).status, 'loading');
+  now += 300000; frames.shift()!(); assert.equal(messages.at(-1).status, 'loading', 'sleep can suspend both documents without a visibility event');
+  for (let i = 0; i < 21; i++) { now += 1000; frames.shift()!(); }
+  assert.equal(messages.at(-1).status, 'error', 'a real visible load stall still fails');
+
   // A dimension reset invalidates all old worker errors and delayed asset results.
   const old = view, oldWorkers = [...view.world.workers], oldError = oldWorkers[0].listeners.error;
   old.world.updateTexturesData(); assert.equal(fetches.length, 1);
   socket.emit('viewer-reset', { npc: 'Sheldon', generation: 2, version: '1.21.4' });
-  assert.equal(viewCount, 2); assert.equal(fetches[0].options.signal.aborted, true);
+  assert.equal(viewCount, 4); assert.equal(fetches[0].options.signal.aborted, true);
   assert.equal(oldWorkers[0].onmessage, null); assert.equal(oldWorkers[0].listeners.error, undefined);
   const resetMessages = messages.length;
   oldError({ message: 'late worker error' }); textureLoads[0].error(new Error('late texture error'));
@@ -270,9 +313,9 @@ test('third-person client follows real motion and cleans up scoped workers, asyn
   onMessage({ source: window.parent, origin: 'http://localhost:18791', data: disposeMessage });
   assert.equal(disposed - beforeClose, 4); assert.equal(contextLoss, 1); assert.equal(frames.length, 0);
   assert.equal(geometryDisposals, 1); assert.equal(materialDisposals, 1); assert.equal(mapDisposals, 1);
-  assert.equal(socket.eventNames().length, 0); assert.deepEqual(Object.keys(callbacks), []);
+  assert.equal(socket.eventNames().length, 0); assert.deepEqual(Object.keys(callbacks), []); assert.deepEqual(Object.keys(documentCallbacks), []);
   const afterCloseMessages = messages.length;
   onPageHide(); onMessage({ source: window.parent, origin: 'http://localhost:18791', data: disposeMessage });
   socket.emit('viewer-reset', { npc: 'Sheldon', generation: 4, version: '1.21.4' });
-  assert.equal(viewCount, 3); assert.equal(disposed - beforeClose, 4); assert.equal(contextLoss, 1); assert.equal(messages.length, afterCloseMessages);
+  assert.equal(viewCount, 5); assert.equal(disposed - beforeClose, 4); assert.equal(contextLoss, 1); assert.equal(messages.length, afterCloseMessages);
 });

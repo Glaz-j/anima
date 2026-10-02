@@ -4,11 +4,12 @@ import { readFile } from 'node:fs/promises';
 import vm from 'node:vm';
 import { CameraSession } from '../adapters/minecraft/public/camera-session.js';
 
-function fixture() {
+function fixture({ visible = true } = {}) {
   let now = 1000, id = 0;
   const timers = new Map<number, { at: number; callback: () => void }>();
   const frames: any[] = [], states: any[] = [];
   const controller = new CameraSession({
+    visible,
     now: () => now,
     schedule(callback: () => void, ms: number) { const key = ++id; timers.set(key, { at: now + ms, callback }); return key; },
     unschedule(key: number) { timers.delete(key); },
@@ -26,14 +27,15 @@ function fixture() {
     for (;;) {
       const entry = [...timers].filter(([, timer]) => timer.at <= end).sort((a, b) => a[1].at - b[1].at)[0];
       if (!entry) break;
-      timers.delete(entry[0]); now = entry[1].at; entry[1].callback();
+      timers.delete(entry[0]); now = Math.max(now, entry[1].at); entry[1].callback();
     }
     now = end;
   }
   const select = (npc: string, force = false) => controller.select('http://127.0.0.1:18792', npc, { force });
   const message = (frame: any, status = 'live') => ({ origin: 'http://127.0.0.1:18792', source: frame.window,
     data: { type: 'anima-viewer-status', npc: frame.npc, sessionId: frame.sessionId, status } });
-  return { controller, frames, states, timers, advance, select, message };
+  const stall = (ms: number) => { now += ms; advance(0); };
+  return { controller, frames, states, timers, advance, stall, select, message };
 }
 
 test('each NPC change removes the old browsing context and repeated API refresh does not reload it', () => {
@@ -111,4 +113,110 @@ test('default timers do not pass the controller as the browser native receiver',
     clearTimeout: function (this: unknown) { assert.equal(this, undefined); cleared++; },
   });
   assert.equal(scheduled, 1); assert.ok(cleared > 0);
+});
+
+test('background time does not expire a live camera or a loading camera', () => {
+  for (const phase of ['live', 'loading']) {
+    const f = fixture(); f.select('Sherlock'); const frame = f.frames[0];
+    f.controller.receive(f.message(frame, phase)); f.advance(3000);
+    f.controller.setVisible(false); f.advance(5 * 60000);
+    assert.equal(f.frames.length, 1); assert.equal(f.timers.size, 0);
+    f.controller.setVisible(true); f.advance(9000);
+    assert.equal(f.frames.length, 1, 'Restoring a tab preserves its existing renderer.');
+    f.controller.receive(f.message(frame)); f.advance(2000);
+    assert.equal(f.frames.length, 1); assert.equal(f.states.at(-1).status, 'live');
+  }
+});
+
+test('a page opened in the background gets its full first loading budget when shown', () => {
+  const f = fixture({ visible: false }); f.select('Deadpool'); f.advance(10 * 60000);
+  assert.equal(f.frames.length, 1); assert.equal(f.timers.size, 0);
+  f.controller.setVisible(true); f.advance(24000);
+  assert.equal(f.frames.length, 1);
+  f.controller.receive(f.message(f.frames[0])); f.advance(2000);
+  assert.equal(f.states.at(-1).status, 'live'); assert.equal(f.frames.length, 1);
+});
+
+test('hiding cancels a queued retry and live recovery on return keeps the same frame', () => {
+  const f = fixture(); f.select('Sheldon'); const frame = f.frames[0];
+  f.controller.receive(f.message(frame, 'disconnected')); f.advance(500);
+  f.controller.setVisible(false); f.advance(5 * 60000);
+  assert.equal(f.frames.length, 1); assert.equal(f.timers.size, 0);
+  f.controller.setVisible(true); f.advance(9000);
+  assert.equal(f.frames.length, 1);
+  f.controller.receive(f.message(frame)); f.advance(4000);
+  assert.equal(f.frames.length, 1); assert.equal(f.states.at(-1).status, 'live');
+});
+
+test('errors received while hidden wait for visibility and a genuinely broken camera still has bounded retries', () => {
+  const f = fixture({ visible: false }); f.select('HuYifei');
+  f.controller.receive(f.message(f.frames[0], 'error')); f.advance(5 * 60000);
+  assert.equal(f.frames.length, 1); assert.equal(f.timers.size, 0);
+  f.controller.setVisible(true); f.advance(9000);
+  assert.equal(f.frames.length, 1);
+  f.advance(90000);
+  assert.equal(f.frames.length, 3); assert.equal(f.states.at(-1).status, 'error');
+  assert.equal(f.timers.size, 0);
+});
+
+test('visibility handshake is scoped to the authenticated child and follows viewport return without rebuilding', () => {
+  const f = fixture({ visible: false }); f.select('Sherlock'); const frame = f.frames[0];
+  assert.equal(frame.messages.length, 0, 'Mounting alone cannot assume the child document is ready.');
+  const foreign = { ...f.message(frame, 'loading'), source: {} };
+  assert.equal(f.controller.receive(foreign), false); assert.equal(frame.messages.length, 0);
+  f.controller.receive(f.message(frame, 'loading'));
+  assert.deepEqual(frame.messages[0], { origin: 'http://127.0.0.1:18792', data: {
+    type: 'anima-viewer-visibility', npc: 'Sherlock', sessionId: frame.sessionId, visible: false,
+  } });
+  f.controller.receive(f.message(frame, 'loading')); assert.equal(frame.messages.length, 1, 'Do not reset a child on every heartbeat.');
+  f.advance(60000); f.controller.setVisible(true);
+  assert.equal(frame.messages.at(-1).data.visible, true); f.advance(20000);
+  f.controller.receive(f.message(frame)); assert.equal(f.frames.length, 1);
+  f.controller.setVisible(false); f.advance(60000); f.controller.setVisible(true);
+  assert.deepEqual(frame.messages.map((row: any) => row.data.visible), [false, true, false, true]);
+  f.controller.receive(f.message(frame)); f.advance(2000);
+  assert.equal(f.frames.length, 1);
+});
+
+test('returning from computer sleep refreshes both clocks before testing live or loading timeouts', () => {
+  for (const phase of ['live', 'loading']) {
+    const f = fixture(); f.select('Deadpool'); const frame = f.frames[0];
+    f.controller.receive(f.message(frame, phase)); f.stall(5 * 60000);
+    assert.equal(f.frames.length, 1); assert.equal(frame.messages.at(-1).data.type, 'anima-viewer-visibility');
+    assert.equal(frame.messages.at(-1).data.visible, true);
+    f.advance(9000); f.controller.receive(f.message(frame)); f.advance(2000);
+    assert.equal(f.frames.length, 1); assert.equal(f.states.at(-1).status, 'live');
+  }
+});
+
+test('a retry timer delayed by sleep gives the old frame a chance to recover and still bounds genuine failure', () => {
+  for (const recover of [true, false]) {
+    const f = fixture(); f.select('Sheldon'); const frame = f.frames[0];
+    f.controller.receive(f.message(frame, 'disconnected')); f.stall(5 * 60000);
+    assert.equal(f.frames.length, 1); f.advance(9000); assert.equal(f.frames.length, 1);
+    if (recover) {
+      f.controller.receive(f.message(frame)); f.advance(2000);
+      assert.equal(f.frames.length, 1); assert.equal(f.states.at(-1).status, 'live');
+    } else {
+      f.advance(90000); assert.equal(f.frames.length, 3);
+      assert.equal(f.states.at(-1).status, 'error'); assert.equal(f.timers.size, 0);
+    }
+  }
+});
+
+test('a delayed disconnect arriving after visibility returns cannot skip the recovery grace', () => {
+  for (const recover of [true, false]) {
+    const f = fixture(); f.select('Sherlock'); const frame = f.frames[0];
+    f.controller.receive(f.message(frame)); f.controller.setVisible(false); f.advance(5 * 60000);
+    f.controller.setVisible(true); f.advance(500);
+    f.controller.receive(f.message(frame, 'disconnected')); f.advance(8000);
+    assert.equal(f.frames.length, 1, 'A newly delivered disconnect must allow fresh packets to recover.');
+    if (recover) {
+      f.controller.receive(f.message(frame)); f.advance(4000);
+      assert.equal(f.frames.length, 1); assert.equal(f.states.at(-1).status, 'live');
+    } else {
+      f.advance(2500); assert.equal(f.frames.length, 2, 'A real disconnect still retries after the grace expires.');
+      f.advance(90000); assert.equal(f.frames.length, 3); assert.equal(f.states.at(-1).status, 'error');
+    }
+  }
 });
