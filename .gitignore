@@ -4,6 +4,8 @@ dist/
 build/
 coverage/
 *.tsbuildinfo
+__pycache__/
+*.py[cod]
 
 # Local configuration
 .env
@@ -16,6 +18,13 @@ coverage/
 /var/*
 !/var/README.md
 *.log
+
+# Locally generated fictional-character skills (source material stays in data/)
+/.claude/skills/sheldon/
+/.claude/skills/sherlock/
+/.claude/skills/deadpool/
+/.claude/skills/lvziqiao/
+/.claude/skills/huyifei/
 
 # Editor and operating system files
 .DS_Store

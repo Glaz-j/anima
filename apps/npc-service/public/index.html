@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Anima · 角色会客室</title>
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <aside class="sidebar">
+    <a class="brand" href="/" aria-label="Anima 首页"><span class="brand-symbol">a<span>·</span></span><span>ANIMA<small>栖灵 · 角色会客室</small></span></a>
+    <div class="nav-label">选择一个人，开始聊聊 <span>05</span></div>
+    <nav id="roles" aria-label="聊天角色"></nav>
+    <div class="sidebar-bottom"><span class="live-dot"></span><span id="connection">正在连接…</span><p>每个人都有自己的记忆。<br>你的对话只保存在这台电脑。</p></div>
+  </aside>
+  <main>
+    <header class="topbar"><div class="breadcrumb">角色实验室 <span>/</span> 一对一会面</div><div class="fiction-label">AI 模拟 · 虚构角色</div></header>
+    <div class="conversation-header"><div class="avatar small" id="header-avatar"></div><div><h1 id="role-name">角色会客室</h1><p id="role-version"></p></div><div class="header-actions"><button id="profile-button" class="quiet-button">人物档案 <span>↗</span></button><button id="new-button" class="quiet-button" title="旧记录会归档保留">新对话 <span>＋</span></button></div></div>
+    <div id="scroll-area" class="scroll-area">
+      <section id="welcome" class="welcome">
+        <div class="eyebrow">A DIFFERENT MIND, A NEW CONVERSATION</div>
+        <div class="avatar hero" id="hero-avatar"></div>
+        <h2 id="welcome-title">今天，想和谁聊聊？</h2>
+        <p id="role-summary"></p><div id="role-tags" class="tags"></div>
+        <div class="starter-label">也可以从这些话题开始</div><div id="starters" class="starters"></div>
+      </section>
+      <section id="messages" class="messages" aria-label="对话记录" aria-live="polite"></section>
+    </div>
+    <div class="composer-wrap"><div id="status" class="status" role="status"></div><form id="composer"><textarea id="input" rows="1" maxlength="2500" aria-label="输入消息" placeholder="说点什么吧…"></textarea><button id="send" type="submit" aria-label="发送消息">↑</button></form><div class="composer-hint"><span>Enter 发送 · Shift + Enter 换行</span><span id="model-label"></span></div></div>
+  </main>
+  <dialog id="profile-dialog"><div class="dialog-header"><div><div class="eyebrow">CHARACTER DOSSIER</div><h2 id="profile-title">人物档案</h2></div><button id="close-profile" class="quiet-button" aria-label="关闭档案">✕</button></div><div id="profile-content"></div></dialog>
+</body>
+</html>

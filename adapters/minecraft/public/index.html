@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>栖灵 · Minecraft 实验室</title><link rel="stylesheet" href="/style.css"><link rel="stylesheet" href="/experience.css"></head>
+<body>
+<header><div><span class="brand">栖灵 / ANIMA</span><h1>四个人格，一个世界。</h1><p>在 Minecraft 中观察 NPC 的选择、对话与协作。</p></div><span id="health" role="status">正在连接本地世界…</span></header>
+<main>
+<section class="panel world-stage" aria-labelledby="watch-title">
+<div class="section-heading"><div><span class="eyebrow">LIVE WORLD</span><h2 id="watch-title">看看他们正在做什么。</h2></div><span id="viewer-state" class="badge" role="status">准备画面</span></div>
+<div class="world-layout"><div class="watch-area">
+<div id="camera-tabs" class="camera-tabs" role="group" aria-label="切换 NPC 视角"></div>
+<div id="viewport" class="viewport"><div id="viewer-placeholder" class="viewer-placeholder"><span>连接同一个 Minecraft 世界</span><p id="viewer-message">正在读取角色与画面服务…</p><button id="viewer-retry" class="secondary" hidden>重新连接画面</button></div><button id="camera-exit" class="camera-exit secondary">退出全屏</button></div>
+<div class="camera-toolbar"><span id="camera-caption">第三人称跟随 · 拖动旋转 · 滚轮缩放</span><div class="button-row"><button id="camera-reset" class="secondary" disabled>重置镜头</button><button id="camera-fullscreen" class="secondary" disabled>全屏观察</button><a id="camera-open" target="_blank" rel="noopener" hidden>独立窗口 ↗</a></div></div>
+<p class="hint render-note">画面同步 NPC 所在区域的真实方块、实体和行动，由浏览器实时渲染；材质与动画可能和原生客户端有差异。</p>
+</div><aside class="join-world"><span class="eyebrow">YOUR TURN</span><h3>走进他们的世界。</h3><p>以自己的玩家身份加入，与四位 NPC 一起探索、建造和生存。</p><button id="play-game" disabled>进入游戏 ↗</button><p id="play-status" class="notice" role="status">正在检查本机客户端…</p><dl><dt>游戏版本</dt><dd id="play-version">Minecraft Java 1.21.4</dd><dt>同一个服务器</dt><dd><code id="play-address">127.0.0.1:25565</code><button id="copy-address" class="text-button">复制</button></dd></dl><p class="hint">点击会打开本机 Minecraft 游戏窗口并连接服务器。进入后使用 WASD 移动，鼠标控制视角，E 打开背包，T 聊天。</p><details><summary>已经打开了 Minecraft？</summary><p class="hint">在「多人游戏 → 直接连接」中填入上面的地址。普通聊天在附近可被 NPC 听见；使用「[世界] 内容」向所有 NPC 广播。</p></details></aside></div>
+</section>
+<section class="experiment panel" aria-labelledby="experiment-title">
+<div class="section-heading"><div><span class="eyebrow">持续目标</span><h2 id="experiment-title">从空手开始，一起生存。</h2></div><span id="phase" class="badge">连接中</span></div>
+<div class="metrics"><div><span>已观测的生存进展</span><strong id="progress-stage">等待出生</strong><small id="progress-description">里程碑来自实际经历，不替角色安排战术。</small></div><div><span>初始空手核验</span><strong id="initial-check">—</strong><small id="initial-description">等待四名角色的真实背包检查</small></div><div><span>正在思考的 NPC</span><strong id="active-tasks">—</strong><small id="cadence">等待调度器</small></div></div>
+<div id="milestones" class="milestones"></div>
+<div class="experiment-bottom"><p id="scenario-description">四人从随机新世界空手合作，获取资源、准备食物与装备、进入下界和末地，最终击败末影龙。</p><div class="button-row"><button id="experiment-start" disabled>开始协作</button><button id="experiment-stop" class="secondary" disabled>暂停所有 NPC</button></div></div>
+<p id="experiment-result" class="notice" role="status"></p>
+<details id="dragon-details" class="rules"><summary id="dragon-summary">末地与最终完成证据 · 尚未进入末地</summary><div class="metrics dragon-metrics"><div><span>最近观测的龙生命</span><strong id="dragon-health">未进入末地</strong><progress id="dragon-progress" max="200" value="0" aria-label="最近观测的龙生命" hidden></progress></div><div><span>剩余末地水晶</span><strong id="crystals">未进入末地</strong><small id="dragon-phase">等待真实末地经历</small></div></div><div id="evidence" class="evidence"><span>等待真实世界的最终完成证据</span></div></details>
+<details class="rules"><summary>本次环境与记录</summary><p id="rules-text"></p><code id="run-id"></code></details>
+</section>
+<section class="cast-section" aria-labelledby="cast-title"><div class="section-heading"><h2 id="cast-title">世界中的角色</h2><span class="hint">动作与计数来自实际执行回执</span></div><div id="cast" class="cast-grid"><p class="empty">角色状态加载中…</p></div></section>
+<div class="detail-grid">
+<section class="panel controls" aria-labelledby="control-title"><h2 id="control-title">观察与手动控制</h2><label for="bot">当前角色</label><select id="bot"></select><p id="persona"></p><div id="position">等待角色进服…</div>
+<label for="instruction">单次任务</label><textarea id="instruction" rows="3" placeholder="例如：观察附近，和队友讨论眼下的情况。"></textarea><div class="button-row"><button id="task" disabled>让角色思考</button><button id="stop" class="secondary" disabled>中断本轮</button></div><p class="hint">单次任务会调用模型。持续协作期间，如需手动接管，请先暂停所有 NPC。</p>
+<label for="message">以这个角色在世界中说话</label><div class="chat-input"><input id="message" maxlength="250" placeholder="输入一条台词"><button id="say" class="secondary" disabled>发送</button></div>
+<details><summary>直接测试移动</summary><div class="coordinates"><input id="x" type="number" step="0.5" placeholder="X" aria-label="X坐标"><input id="y" type="number" step="0.5" placeholder="Y" aria-label="Y坐标"><input id="z" type="number" step="0.5" placeholder="Z" aria-label="Z坐标"></div><button id="move" class="secondary" disabled>走到坐标</button></details><pre id="result" role="status">选择角色，可以查看近期经历和实际行动结果。</pre></section>
+<section class="panel experiences" aria-labelledby="experience-title"><div class="section-heading"><h2 id="experience-title">这个角色的近期经历</h2><a id="viewer-link" target="_blank" rel="noopener" hidden>单独打开画面 ↗</a></div><p class="hint">与上方镜头同步选择角色，查看观察、对话与行动回执。</p><div id="events"><p class="empty">等待角色进入世界…</p></div></section>
+</div></main><footer>栖灵 · Anima <span>人格独立，经历持续，世界真实执行。</span></footer><script type="module" src="/app.js"></script></body></html>

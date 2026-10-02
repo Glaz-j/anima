@@ -17,4 +17,4 @@
 
 由本模块导入 `Agent`，配置模型流式调用函数、上下文转换与 NPC 工具，实现 `npc-core` 定义的运行接口。工具直接注册到 Agent，不依赖 `pi-coding-agent` 的 Extension 加载机制。
 
-当前已提供 [Agent 调用示例](examples/README.md)，包含离线演示和真实模型模式。服务运行适配尚未实现，`src/` 仍为占位目录。
+当前已提供 [Agent 调用示例](examples/README.md)，包含离线演示和真实模型模式。`src/model.ts` 加载真实模型配置，`src/role-chat.ts` 组装角色上下文、材料检索工具和流式对话，`src/visible-text.ts` 过滤部分兼容接口输出在正文中的推理标签。由 NPC 服务调用，角色资料与会话存储仍位于 NPC 核心侧。

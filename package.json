@@ -5,13 +5,30 @@
   "description": "栖灵 · Anima — 模拟人格与可替换世界之间的运行系统",
   "type": "module",
   "scripts": {
-    "example:pi": "node --env-file-if-exists=.env packages/pi-runtime/examples/npc.ts"
+    "example:pi": "node --env-file-if-exists=.env packages/pi-runtime/examples/npc.ts",
+    "roles:prepare": "python -B -X utf8 scripts/prepare-roles.py",
+    "roles:build": "node --env-file-if-exists=.env scripts/build-roles.ts",
+    "chat": "node --env-file-if-exists=.env apps/npc-service/src/server.ts",
+    "test:roles": "node --test tests/role-chat.test.ts",
+    "minecraft:setup": "python -B -X utf8 scripts/minecraft/setup.py",
+    "minecraft:demo": "python -B -X utf8 scripts/minecraft/setup.py --launch-demo",
+    "minecraft:start": "node --env-file-if-exists=.env adapters/minecraft/src/server.ts",
+    "minecraft:smoke": "node --env-file-if-exists=.env adapters/minecraft/scripts/smoke.ts",
+    "test:minecraft": "node --test tests/minecraft.test.ts tests/viewer.test.ts tests/camera-session.test.ts tests/play-client.test.ts",
+    "minecraft:launcher": "python -B -X utf8 scripts/minecraft/launcher.py",
+    "minecraft:up": "node --env-file-if-exists=.env scripts/minecraft/control.ts",
+    "minecraft:stop": "node --env-file-if-exists=.env scripts/minecraft/control.ts --stop",
+    "minecraft:status": "node scripts/minecraft/status.ts",
+    "minecraft:dragon": "node --env-file-if-exists=.env scripts/minecraft/control.ts --dragon",
+    "minecraft:survival": "node --env-file-if-exists=.env scripts/minecraft/control.ts --survival",
+    "test:world": "node --test tests/world-agent.test.ts tests/goal-review.test.ts tests/npc-scheduler.test.ts tests/minecraft-model.test.ts tests/native-actions.test.ts tests/fishing-action.test.ts tests/consumption-action.test.ts tests/body-observation.test.ts tests/idle-water-posture.test.ts tests/local-navigation.test.ts tests/approach.test.ts tests/local-perception.test.ts tests/local-communication.test.ts tests/survival-actions.test.ts tests/dragon-scenario.test.ts tests/survival-scenario.test.ts tests/survival-server.test.ts"
   },
   "engines": {
     "node": ">=22.19.0"
   },
   "workspaces": [
     "apps/*",
-    "packages/*"
+    "packages/*",
+    "adapters/minecraft"
   ]
 }
