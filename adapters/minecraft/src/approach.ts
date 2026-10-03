@@ -214,6 +214,14 @@ async function navigate(bot: any, proposal: any, signal: AbortSignal, controls: 
       const facade = { registry: bot.registry, game: { minY: bot.game?.minY ?? -64 },
         inventory: { items: () => [] }, entities: {}, entity: bot.entity, blockAt: plannerGet };
       const movements = new Movements(facade);
+      // 2.4.5 can return its unknown-block sentinel above a known drop support,
+      // then dereference the sentinel's absent position in getMoveDropDown.
+      // Reject that candidate locally; keep original budget/abort failures.
+      const getLandingBlock = movements.getLandingBlock.bind(movements);
+      movements.getLandingBlock = (node: any, direction: any) => {
+        const landing = getLandingBlock(node, direction);
+        return landing?.position && ['x', 'y', 'z'].every(axis => Number.isFinite(landing.position[axis])) ? landing : null;
+      };
       movements.canDig = false; movements.allow1by1towers = false; movements.allowParkour = false;
       movements.allowSprinting = false; movements.canOpenDoors = false; movements.allowEntityDetection = false;
       // Pathfinder 2.4.5 counts down to the supporting block, one below the

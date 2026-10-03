@@ -292,6 +292,48 @@ test('travel can round an occluding loaded wall with legal native movement witho
   assert.doesNotMatch(JSON.stringify(result), /diamond_ore|waypoints|blocker/); assert.deepEqual(bot.controls, {});
 });
 
+for (const kind of ['travel', 'approach'] as const)
+test(`${kind} ignores a known drop support whose landing cell is unloaded and uses a loaded route`, async () => {
+  const { bot, reads, steps } = fixture(p => p.x === 1 && p.y === 63 && p.z === 0 ? null
+    : kind === 'approach' && p.x === 6 && p.y === 64 && p.z === 0 ? 'oak_log' : openFloor(p));
+  const result = kind === 'travel'
+    ? await travelToArea(bot, { type: 'travel', x: 6.5, z: .5 }, new AbortController().signal, controls)
+    : await approachTarget(bot, { type: 'approach', position: { x: 6, y: 64, z: 0 } }, new AbortController().signal, controls);
+  assert.equal(result.reached, true); assert.ok(result.planning.legs > 0);
+  assert.ok(reads.some(p => p.equals(new Vec3(1, 62, 0))), 'The actual planner inspected the known lower support.');
+  assert.ok(reads.some(p => p.equals(new Vec3(1, 63, 0))), 'The landing above that support was genuinely unknown.');
+  assert.ok(steps.some(p => Math.floor(p.z) !== 0), 'Movement uses the known route around the unknown cell.');
+  assert.ok(steps.every(p => p.y === 64 && !(Math.floor(p.x) === 1 && Math.floor(p.z) === 0)));
+  assert.deepEqual(bot.controls, {});
+});
+
+test('an unknown drop landing cannot become a route when no loaded alternative exists', async () => {
+  const { bot, steps } = fixture(p => p.z !== 0 || p.x < 0 || p.x > 6 || p.x === 1 && p.y === 63
+    ? null : openFloor(p));
+  await assert.rejects(travelToArea(bot, { type: 'travel', x: 6.5, z: .5 }, new AbortController().signal, controls), (error: any) => {
+    assert.equal(error.details.travel.stoppedReason, 'no_path'); assert.equal(error.details.travel.reached, false);
+    assert.equal(error.details.travel.planning.legs, 0); assert.equal(error.details.travel.partial, false); return true;
+  });
+  assert.deepEqual(steps, []); assert.deepEqual(bot.controls, {});
+});
+
+test('drop candidate validation propagates typed planning failures instead of hiding them as missing landings', async () => {
+  const { bot, steps } = fixture(openFloor), blockAt = bot.blockAt;
+  const budget = Object.assign(new Error('Collision read budget exhausted while inspecting a drop.'), { approachCode: 'read_budget' });
+  bot.blockAt = (p: Vec3) => {
+    const block = blockAt(p);
+    // The actual Movements.getLandingBlock reads this support's position.
+    // Inject the same typed boundary failure as our bounded collision reader.
+    if (p.equals(new Vec3(1, 62, 0))) Object.defineProperty(block, 'position', { get() { throw budget; } });
+    return block;
+  };
+  await assert.rejects(travelToArea(bot, { type: 'travel', x: 6.5, z: .5 }, new AbortController().signal, controls), (error: any) => {
+    assert.equal(error, budget); assert.equal(error.details.travel.stoppedReason, 'read_budget');
+    assert.equal(error.details.travel.planning.legs, 0); return true;
+  });
+  assert.deepEqual(steps, []); assert.deepEqual(bot.controls, {});
+});
+
 test('travel takes its safe reachable prefix once and stops before unknown crossings or unsupported cliffs', async () => {
   for (const kind of ['unknown', 'cliff']) {
     const { bot, steps } = fixture(p => kind === 'unknown' && p.x >= 3 ? null

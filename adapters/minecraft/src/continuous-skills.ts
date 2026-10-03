@@ -74,6 +74,12 @@ function space(bot: any, feet: Vec3, allowWater = false) {
 function groundedPlatform(bot: any, feet: Vec3) {
   return support(block(bot, feet.offset(0, -.05, 0))) && space(bot, feet);
 }
+/** Shared local precondition; an unavailable shore must not gate emergency ascent. */
+export function surfaceTargetAvailable(bot: any, target: { x: number; y: number; z: number }) {
+  const feet = vector(target);
+  try { return feet.distanceTo(bot.entity.position) <= 12 && groundedPlatform(bot, feet); }
+  catch { return false; }
+}
 // The centre of a floor block behind a same-height rim can be hidden even when
 // its walkable top face is visible. Sample that actual surface, not underground.
 function shoreVisible(bot: any, feet: Vec3) {
@@ -189,8 +195,8 @@ async function pickup(bot: any, action: any, signal: AbortSignal) {
 }
 
 async function surface(bot: any, action: any, signal: AbortSignal, elapsed: () => boolean) {
-  const target = action.target === undefined ? undefined : position(action.target), origin = bot.entity.position.clone();
-  if (target && (target.distanceTo(origin) > 12 || !groundedPlatform(bot, target)))
+  const target = action.target === undefined ? undefined : position(action.target);
+  if (target && !surfaceTargetAvailable(bot, target))
     throw failure('shore_unavailable', '岸点必须是12格内已加载且可站立的真实平台。');
   const details: any = { controlTicks: 0, shoreReached: false, dryGround: false, breathingConfirmed: false };
   try { while (!elapsed()) {

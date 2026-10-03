@@ -32,7 +32,7 @@ function fixture(optimized: boolean) {
   const body = new MinecraftBody(world, record); record.body = body; body.setThroughputOptimizations(optimized);
   let now = Date.now(); (body.controller as any).now = () => now;
   return { bot, body, events, calls,
-    async tick() { now += 10000; body.controller.tick(); await flush(); },
+    async tick(ms = 10000) { now += ms; body.controller.tick(); await flush(); },
     async finish(index: number, details: any, status = 'failed') {
       calls[index].finish({ status, action: calls[index].action, details }); await flush();
     },
@@ -132,6 +132,127 @@ test('an actually occluded dig target requests fresh planning once without discl
   assert.deepEqual(f.body.snapshot().completedSteps, []);
   assert.deepEqual(f.body.snapshot().replanRequired, blocked.replanRequired);
   assert.equal(f.events.filter(event => event.type === 'goal-blocked').length, 1);
+});
+
+for (const invalid of ['unloaded', 'unsupported', 'out_of_range'] as const)
+test(`an ${invalid} planned shore cannot prevent authorized upward input or survive cancellation`, async t => {
+  const f = fixture(true); t.after(() => f.clean());
+  f.bot.entity.isInWater = true; f.bot.entity.onGround = false;
+  const blockAt = f.bot.blockAt;
+  f.bot.blockAt = (p: Vec3) => p.x < 2
+    ? { name: 'water', boundingBox: 'empty', position: p }
+    : invalid === 'unloaded' ? null : invalid === 'unsupported'
+      ? { name: 'air', boundingBox: 'empty', position: p } : blockAt(p);
+  const step = { type: 'surface', durationMs: 1000, target: { x: invalid === 'out_of_range' ? 13 : 3, y: 64, z: 0 } };
+  await assert.rejects(runContinuousSkill(f.bot, step, new AbortController().signal),
+    (error: any) => error.details.stoppedReason === 'shore_unavailable');
+  assert.equal(f.bot.getControlState('jump'), false, 'Explicit shore work still rejects the unavailable destination.');
+  await f.submit([step], { reactions: ['surface'] });
+  assert.equal(f.body.snapshot().current?.skill.reaction, 'surface');
+  assert.equal(f.calls[0].action.target, undefined);
+  const pending = runContinuousSkill(f.bot, f.calls[0].action, f.calls[0].signal);
+  const rejected = assert.rejects(pending);
+  assert.equal(f.bot.getControlState('jump'), true, 'Emergency ascent writes real upward input before its next tick.');
+  assert.equal(f.bot.getControlState('forward'), false);
+  assert.equal(f.body.cancel(f.body.snapshot().version).accepted, true);
+  assert.equal(f.calls[0].signal.aborted, true); assert.equal(f.bot.getControlState('jump'), false);
+  await rejected; await f.finish(0, {}, 'cancelled'); await f.tick();
+  assert.equal(f.calls.length, 1); assert.equal(f.bot.jumpQueued, false);
+  assert.deepEqual(f.body.snapshot().completedSteps, []); assert.equal(f.body.snapshot().workCompleted, false);
+});
+
+test('emergency ascent preserves blocked shore work and renewal without claiming shore arrival', async t => {
+  const f = fixture(true); t.after(() => f.clean());
+  const steps = [{ type: 'surface', durationMs: 1000, target: { x: 3, y: 64, z: 0 } }, { type: 'wait', ms: 100 }];
+  const extra = { reactions: ['surface'] };
+  f.bot.blockAt = (p: Vec3) => ({ name: 'water', boundingBox: 'empty', position: p });
+  await f.submit(steps, extra);
+  for (let i = 0; i < 3; i++) {
+    let details: any;
+    await assert.rejects(runContinuousSkill(f.bot, f.calls[i].action, f.calls[i].signal), (error: any) => {
+      details = error.details; return details.stoppedReason === 'shore_unavailable';
+    });
+    await f.finish(i, details); await f.tick();
+  }
+  const blocked = f.body.snapshot().replanRequired;
+  assert.equal(blocked?.code, 'repeated_no_progress'); assert.equal(f.calls.length, 3);
+  assert.equal((await f.submit(steps, extra)).unchanged, true);
+  f.bot.entity.isInWater = true; f.bot.entity.onGround = false; await f.tick();
+  assert.equal(f.calls.length, 4); assert.equal(f.calls[3].action.target, undefined);
+  let eyesInAir = false;
+  f.bot.blockAt = (p: Vec3) => ({ name: eyesInAir && p.y >= 65 ? 'air' : 'water', boundingBox: 'empty', position: p });
+  const write = f.bot.setControlState;
+  f.bot.setControlState = (key: string, value: boolean) => { write.call(f.bot, key, value); if (key === 'jump' && value) eyesInAir = true; };
+  const details = await runContinuousSkill(f.bot, f.calls[3].action, f.calls[3].signal);
+  assert.equal(details.surfaceReached, true); assert.equal(details.shoreReached, false);
+  assert.equal(details.breathingConfirmed, false); assert.equal(f.bot.getControlState('jump'), false);
+  await f.finish(3, details, 'completed'); f.bot.entity.isInWater = false; await f.tick();
+  assert.equal(f.calls.length, 4); assert.deepEqual(f.body.snapshot().replanRequired, blocked);
+  assert.deepEqual(f.body.snapshot().completedSteps, []); assert.equal(f.body.snapshot().workCompleted, false);
+});
+
+test('a valid shore remains selected and loss of support drains it before vertical fallback', async t => {
+  const f = fixture(true); t.after(() => f.clean()); f.bot.entity.isInWater = true;
+  const target = { x: 3, y: 64, z: 0 };
+  await f.submit([{ type: 'surface', target }], { reactions: ['surface'] });
+  assert.deepEqual(f.calls[0].action.target, target);
+  f.bot.blockAt = () => null;
+  await f.tick(100); await f.tick(300);
+  assert.equal(f.calls[0].signal.aborted, true); assert.equal(f.calls.length, 1, 'Single ownership waits for the old receipt.');
+  assert.match(String(f.calls[0].signal.reason), /Preempted/);
+  await f.finish(0, {}, 'cancelled'); await f.tick();
+  assert.equal(f.calls.length, 2); assert.equal(f.calls[1].action.target, undefined);
+  assert.deepEqual(f.body.snapshot().completedSteps, []);
+});
+
+test('water and an invalid planned shore do not grant an unauthorized surface reaction', async t => {
+  const f = fixture(true); t.after(() => f.clean()); f.bot.entity.isInWater = true;
+  const steps = [{ type: 'wait', ms: 100 }, { type: 'surface', target: { x: 13, y: 64, z: 0 } }];
+  await f.submit(steps);
+  assert.equal(f.calls[0].action.type, 'wait'); assert.equal(f.body.snapshot().current?.skill.reaction, undefined);
+});
+
+test('unstarted travel cannot renew its progress allowance through passive vertical water drift', async t => {
+  const f = fixture(true); t.after(() => f.clean()); f.bot.entity.onGround = false;
+  const steps = [{ type: 'travel', x: 4, z: 0 }, { type: 'wait', ms: 100 }], extra = { reactions: ['surface'] };
+  await f.submit(steps, extra);
+  for (let i = 0; i < 3; i++) {
+    const pending = runNativeAction(f.bot, f.calls[i].action, f.calls[i].signal);
+    f.bot.entity.position.y += .4;
+    let details: any;
+    await assert.rejects(pending, (error: any) => {
+      details = error.details;
+      assert.equal(details.travel.stoppedReason, 'not_grounded');
+      for (const key of ['plans', 'nodes', 'legs']) assert.equal(details.travel.planning[key], 0);
+      assert.equal(details.travel.partial, true, 'The truthful physical displacement remains in the receipt.');
+      return true;
+    });
+    await f.finish(i, details); await f.tick();
+  }
+  const blocked = f.body.snapshot().replanRequired;
+  assert.equal(blocked?.code, 'repeated_no_progress'); assert.equal(f.calls.length, 3);
+  assert.equal(f.bot.entity.position.x, 0); assert.equal(f.bot.entity.position.z, 0);
+  assert.deepEqual(f.body.snapshot().completedSteps, []); assert.equal(f.body.snapshot().workCompleted, false);
+  assert.equal((await f.submit(steps, extra)).unchanged, true); await f.tick();
+  assert.equal(f.calls.length, 3); assert.deepEqual(f.body.snapshot().replanRequired, blocked);
+  f.bot.entity.isInWater = true; await f.tick();
+  assert.equal(f.calls[3].action.type, 'surface', 'Suspending failed travel must retain authorized self-preservation.');
+});
+
+for (const [label, displacement, planning, outer] of [
+  ['horizontal movement', new Vec3(.2, .4, 0), { plans: 0, nodes: 0, legs: 0 }, undefined],
+  ['an executed navigation leg', new Vec3(0, .4, 0), { plans: 1, nodes: 2, legs: 1 }, undefined],
+  ['missing execution evidence', new Vec3(0, .4, 0), undefined, undefined],
+  ['a different current typed result', new Vec3(0, .4, 0), { plans: 0, nodes: 0, legs: 0 }, 'server_unconfirmed'],
+] as const) test(`water progress correction preserves ${label}`, async t => {
+  const f = fixture(true); t.after(() => f.clean());
+  await f.submit([{ type: 'travel', x: 4, z: 0 }]);
+  for (let i = 0; i < 3; i++) {
+    f.bot.entity.position = f.bot.entity.position.plus(displacement);
+    await f.finish(i, { ...(outer ? { stoppedReason: outer } : {}), travel: { stoppedReason: 'not_grounded', planning } });
+    await f.tick();
+  }
+  assert.equal(f.body.snapshot().replanRequired, undefined); assert.equal(f.calls.length, 4);
 });
 
 for (const [label, current, expected] of [

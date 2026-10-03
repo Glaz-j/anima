@@ -5,10 +5,11 @@ import { bodyEnvironment } from './body-observation.ts';
 import { entityVisible, entityHealth, haltNative } from './native-actions.ts';
 import { inventorySessionUsable } from './craft-sync.ts';
 import { trackInputs } from './input-telemetry.ts';
-import { findSafeFood } from './continuous-skills.ts';
+import { findSafeFood, surfaceTargetAvailable } from './continuous-skills.ts';
 import { copyGatherState } from './survival-actions.ts';
 import { droppedItemSummary } from './entity-observation.ts';
 import { BRIDGE_LIMITS, BRIDGE_MATERIALS } from './bridge-skill.ts';
+import { createLocalThreats } from './local-threats.ts';
 import type { MinecraftWorld, BotRecord } from './world.ts';
 
 const REACTIONS = ['surface', 'eat', 'defend', 'flee'] as const;
@@ -113,7 +114,8 @@ export class MinecraftBody {
   private movementScope = 0;
   private dimension?: string;
   private lastHealth?: number;
-  private movementListeners: { event: string; listener: () => void }[] = [];
+  private movementListeners: { event: string; listener: (...args: any[]) => void }[] = [];
+  private localThreats: ReturnType<typeof createLocalThreats>;
   private cache?: { at: number; enemies: any[] };
   private hazard?: { id: string; key: string; at: number; reacted?: boolean };
   private quietUntil = 0;
@@ -127,6 +129,10 @@ export class MinecraftBody {
 
   constructor(world: MinecraftWorld, record: BotRecord, emitMetric: (event: any) => void = () => {}) {
     this.world = world; this.record = record;
+    this.localThreats = createLocalThreats(record.bot, {
+      isVisible: entity => entityVisible(record.bot, entity),
+      isAlive: entity => entityHealth(record.bot, entity) !== 0,
+    });
     this.emitMetric = event => { try { emitMetric(event); } catch { /* Observability cannot take body ownership. */ } };
     record.waterPosture?.disable();
     this.telemetry = trackInputs(record.bot, event => {
@@ -149,13 +155,20 @@ export class MinecraftBody {
     });
     this.dimension = record.bot.game?.dimension;
     this.lastHealth = record.bot.health;
-    for (const event of ['death', 'respawn', 'spawn', 'game', 'health']) {
+    for (const event of ['death', 'respawn', 'spawn', 'end', 'game', 'health']) {
       const listener = () => {
-        if (['death', 'respawn', 'spawn'].includes(event)) this.resetMovementScope();
+        if (['death', 'respawn', 'spawn', 'end'].includes(event)) this.resetMovementScope();
         this.checkMovementLifecycle();
       };
       record.bot.on(event, listener); this.movementListeners.push({ event, listener });
     }
+    const hurt = (victim: any, source: any) => {
+      const status = this.controller.snapshot();
+      if (!record.ready || status.stopped || status.disposed) return;
+      // Mineflayer supplies the local damage source; proximity alone is not evidence.
+      if (this.localThreats.record(victim, source)) this.cache = undefined;
+    };
+    record.bot.on('entityHurt', hurt); this.movementListeners.push({ event: 'entityHurt', listener: hurt });
     this.controller.start();
   }
 
@@ -320,6 +333,7 @@ export class MinecraftBody {
 
   private resetMovementScope() {
     this.encounter = undefined; this.stepOrigins.clear(); this.cache = undefined;
+    this.localThreats.clear();
     this.lastDangerAt = 0; this.movementScope++;
   }
 
@@ -351,7 +365,8 @@ export class MinecraftBody {
     this.emitMetric({ type: 'control-tick', at: now });
     const ready = this.record.ready && !!bot.entity && bot.health > 0;
     if (ready && (!this.cache || now - this.cache.at >= 200)) {
-      const enemies = Object.values(bot.entities).filter((e: any) => e.id !== bot.entity.id && HOSTILE.has(e.name)
+      const enemies = Object.values(bot.entities).filter((e: any) => e.id !== bot.entity.id
+        && (HOSTILE.has(e.name) || this.localThreats.has(e))
         && entityHealth(bot, e) !== 0
         && e.position && e.position.distanceTo(bot.entity.position) <= 24 && entityVisible(bot, e));
       this.cache = { at: now, enemies };
@@ -359,7 +374,8 @@ export class MinecraftBody {
     const environment = bodyEnvironment(bot);
     return { ready, health: bot.health, food: bot.food, water: environment.locomotion?.inWater === true,
       lava: environment.locomotion?.inLava === true, oxygen: environment.oxygen?.level,
-      enemies: ready ? (this.cache?.enemies || []).filter(e => bot.entities[e.id] === e && entityHealth(bot, e) !== 0)
+      enemies: ready ? (this.cache?.enemies || []).filter(e => bot.entities[e.id] === e && entityHealth(bot, e) !== 0
+        && (HOSTILE.has(e.name) || this.localThreats.has(e)))
         .map(e => ({ id: e.id, name: e.name, distance: e.position.distanceTo(bot.entity.position) })).sort((a, b) => a.distance - b.distance) : [] };
   }
 
@@ -386,13 +402,15 @@ export class MinecraftBody {
       this.hazard = { id: randomUUID(), key, at: now };
       this.emitMetric({ type: 'hazard-observed', at: now, hazardId: this.hazard.id });
     };
-    // Intentional swimming can choose a shore target; emergencies reuse that skill without a separate owner.
+    // Reuse a locally valid shore, but an obsolete work target cannot prevent
+    // authorized vertical ascent. Reaction receipts never complete shore work.
     if (state.water && allowed.includes('surface') && !state.lava
       && (state.oxygen === undefined || state.oxygen < 18)) {
       markHazard('water');
       const plannedSurface = intent.goal.steps.find((s: any, i: number) => s.type === 'surface' && !this.completed.has(i));
       const surface = current?.skill.reaction === 'surface' ? current.skill.action.native : plannedSurface;
-      return run(surface || { type: 'surface', durationMs: 8000 }, 100, 'surface');
+      const usable = surface && (!surface.target || surfaceTargetAvailable(this.record.bot, surface.target));
+      return run(usable ? surface : { type: 'surface', durationMs: surface?.durationMs ?? 8000 }, 100, 'surface');
     }
     const enemy = state.enemies.find(e => e.distance <= p.threatRange);
     if (enemy) {
@@ -487,9 +505,16 @@ export class MinecraftBody {
   }
 
   private madeProgress(receipt: NonNullable<BodyEvent['receipt']>) {
-    const details: any = (receipt.result as any)?.details ?? {}, start = this.skillStart;
-    const moved = start?.key === receipt.key && this.record.bot.entity?.position
-      && this.record.bot.entity.position.distanceTo(start.position) >= .15;
+    const result: any = receipt.result, details = result?.details ?? {}, start = this.skillStart;
+    const planning = details.travel?.planning;
+    const unstartedTravel = receipt.status === 'failed' && result?.action?.type === 'travel'
+      && stoppedCode(details) === 'not_grounded' && planning?.plans === 0 && planning.nodes === 0 && planning.legs === 0;
+    const current = this.record.bot.entity?.position;
+    // Before navigation executes any leg, water buoyancy can change Y while
+    // making no progress toward travel's horizontal goal. Keep the raw receipt.
+    const moved = start?.key === receipt.key && current && (unstartedTravel
+      ? Math.hypot(current.x - start.position.x, current.z - start.position.z)
+      : current.distanceTo(start.position)) >= .15;
     return !!(moved || details.minedBlocks > 0 || details.spent > 0 || details.inventoryIncreased === true
       || details.consumptionConfirmed === true || details.killConfirmed === true
       || Number.isFinite(details.healthAfter) && Number.isFinite(details.healthBefore) && details.healthAfter < details.healthBefore
@@ -525,6 +550,7 @@ export class MinecraftBody {
     const ended = event.type === 'intent-cancelled' ? 'cancelled' : event.type === 'intent-expired' ? 'expired'
       : event.type === 'control-stopped' ? 'stopped' : undefined;
     if (ended) { this.goalStatus = ended; this.goalFinished = false; this.replanRequired = undefined; }
+    if (event.type === 'control-stopped') { this.localThreats.clear(); this.cache = undefined; }
     if (['skill-finished', 'skill-cancelling', 'control-stopped'].includes(event.type)) this.activeReaction = undefined;
     const receipt = event.receipt;
     if (event.type === 'skill-finished' && receipt) {
