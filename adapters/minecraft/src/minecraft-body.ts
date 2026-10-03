@@ -77,7 +77,9 @@ export function validateBodyAction(raw: any) {
     if (type === 'combat' || type === 'retreat' || type === 'pickup') {
       if (!Number.isInteger(raw.entityId) || raw.entityId < 0) throw new ApiError(400, '技能需要当前可见实体ID。');
       const maxDistance = raw.maxDistance ?? 12;
-      if (!Number.isFinite(maxDistance) || maxDistance < 0 || maxDistance > 24) throw new ApiError(400, '局部移动范围必须是0–24格。');
+      const maxRange = type === 'pickup' ? 32 : 24;
+      if (!Number.isFinite(maxDistance) || maxDistance < 0 || maxDistance > maxRange)
+        throw new ApiError(400, `局部移动范围必须是0–${maxRange}格。`);
       return { type, entityId: raw.entityId, durationMs, maxDistance,
         ...(raw.origin ? { origin: coordinates(raw.origin) } : {}) };
     }

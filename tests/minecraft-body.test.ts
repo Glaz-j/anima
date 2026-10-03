@@ -312,6 +312,23 @@ test('invalid pursuit limits never silently widen into executor defaults', () =>
   assert.equal(validateBodyAction({ type: 'combat', entityId: 9, maxDistance: 4 }).maxDistance, 4);
 });
 
+test('pickup range accepts the gather maximum without widening combat or retreat', () => {
+  const origin = { x: 20, y: 64, z: 0 };
+  const pickup = validateBodyAction({ type: 'pickup', entityId: 50, origin, maxDistance: 32 });
+  assert.equal(pickup.maxDistance, 32); assert.deepEqual(pickup.origin, origin);
+  assert.equal(pickup.durationMs, 8000);
+  for (const maxDistance of [-1, 32.01, Infinity, '32'])
+    assert.throws(() => validateBodyAction({ type: 'pickup', entityId: 50, maxDistance }));
+  for (const type of ['pickup', 'combat', 'retreat']) {
+    assert.equal(validateBodyAction({ type, entityId: 50 }).maxDistance, 12);
+    assert.equal(validateBodyAction({ type, entityId: 50, maxDistance: 0 }).maxDistance, 0);
+  }
+  for (const type of ['combat', 'retreat']) {
+    assert.equal(validateBodyAction({ type, entityId: 50, maxDistance: 24 }).maxDistance, 24);
+    assert.throws(() => validateBodyAction({ type, entityId: 50, maxDistance: 25 }));
+  }
+});
+
 test('accepted retreat and jump durations match the actual continuous executor limits', () => {
   const retreat = validateBodyAction({ type: 'retreat', entityId: 9 });
   const jump = validateBodyAction({ type: 'jump_to', x: 2, y: 64, z: 0 });
@@ -1029,4 +1046,29 @@ test('gather establishes its area when its own step starts, then fallback pickup
   f.bot.entities[50].position = new Vec3(22, 64, 0); now += 200; f.body.controller.tick(); await flush();
   assert.equal(f.calls[2].action.type, 'pickup'); assert.deepEqual(f.calls[2].action.origin, { x: 20, y: 64, z: 0 });
   assert.equal(f.calls[2].action.maxDistance, 4);
+});
+
+test('maximum-range gather fallback pickup passes production action validation with its original area', async t => {
+  const f = fixture(); t.after(() => f.clean());
+  const executeOwned = f.world.executeOwned.bind(f.world);
+  f.world.executeOwned = (name, raw, signal) => {
+    validateBodyAction(raw);
+    return executeOwned(name, raw, signal);
+  };
+  await f.submit([{ type: 'gather', block: 'oak_log', count: 1, maxDistance: 32 }], { policy: { chaseRange: 4 } });
+  assert.equal(f.calls.length, 1);
+  const origin = { x: 0, y: 64, z: 0 };
+  assert.deepEqual(f.calls[0].action.gatherState.origin, origin);
+  f.bot.entity.position = new Vec3(27, 64, 0);
+  f.bot.entities[50] = { id: 50, name: 'item', position: new Vec3(28, 64, 0), getDroppedItem: () => ({ name: 'oak_log', count: 1 }) };
+  await f.finish(0, { minedBlocks: 1, pickupConfirmed: false, inventoryDelta: [] });
+  f.body.controller.tick(); await flush();
+  assert.equal(f.calls.length, 2, 'A valid gather radius must not fail validation when translated into pickup.');
+  assert.equal(f.calls[1].action.type, 'pickup'); assert.equal(f.calls[1].action.entityId, 50);
+  assert.equal(f.calls[1].action.maxDistance, 32); assert.deepEqual(f.calls[1].action.origin, origin);
+  assert.deepEqual(f.body.snapshot().completedSteps, [], 'Starting pickup does not confirm inventory gain.');
+  f.inventory([{ name: 'oak_log', count: 1 }]);
+  await f.finish(1, { inventoryIncreased: true, inventoryDelta: [{ item: 'oak_log', change: 1 }] });
+  f.body.controller.tick(); await flush();
+  assert.deepEqual(f.body.snapshot().completedSteps, [0]);
 });
