@@ -1072,3 +1072,22 @@ test('maximum-range gather fallback pickup passes production action validation w
   f.body.controller.tick(); await flush();
   assert.deepEqual(f.body.snapshot().completedSteps, [0]);
 });
+
+test('construction continues partial slices under one grant and plans against remaining blocks, not a two-second default',async t=>{
+  const f=fixture();t.after(()=>f.clean());
+  const step={type:'build',blueprint:'railed-bridge',origin:{x:0,y:64,z:0}};
+  await f.submit([step],{ttlMs:120000,reactions:[]});
+  const intent=f.body.snapshot().intent!.id;
+  assert.equal(f.calls[0].action.type,'build');
+  assert.ok(f.body.snapshot().remainingWorkMs>=48000);assert.equal(f.body.snapshot().planningNeeded,false);
+  await f.finish(0,{placed:12,matched:12,total:49,reached:false,inventoryConfirmed:true,stoppedReason:'build_slice_complete'});
+  f.body.controller.tick();await flush();
+  assert.deepEqual(f.body.snapshot().completedSteps,[]);assert.equal(f.body.snapshot().workCompleted,false);
+  assert.equal(f.body.snapshot().intent!.id,intent);assert.equal(f.calls[1].action.type,'build');
+  for(let i=1;i<4;i++){
+    await f.finish(i,{placed:12,matched:(i+1)*12,total:49,reached:false,inventoryConfirmed:true,stoppedReason:'build_slice_complete'});
+    f.body.controller.tick();await flush();assert.equal(f.body.snapshot().workCompleted,false);
+  }
+  await f.finish(4,{placed:1,matched:49,total:49,reached:true,inventoryConfirmed:true,stoppedReason:'build_complete'});
+  f.body.controller.tick();await flush();assert.equal(f.body.snapshot().workCompleted,true);assert.deepEqual(f.body.snapshot().completedSteps,[0]);
+});

@@ -8,6 +8,7 @@ import { runWorldAgent } from '../../../packages/pi-runtime/src/world-agent.ts';
 import { loadModel } from '../../../packages/pi-runtime/src/model.ts';
 import { ApiError, text } from './validation.ts';
 import type { BodyActivationTicket, MinecraftWorld } from './world.ts';
+import { describeBuild } from './build-blueprints.ts';
 
 // Keep the shared provider/credentials; an optional per-actor ID changes only this runtime.
 export function loadNpcModel(name: string) {
@@ -84,6 +85,7 @@ export async function runTask(world: MinecraftWorld, name: string, instruction: 
       port: {
         name, persona: record.persona, roleId: record.roleId,
         observe: () => world.observe(name),
+        constructionPlan: options => describeBuild(options),
         subscribe: listener => world.subscribe(name, listener),
         interruptAction: () => { if (!record.body) world.interruptAction(name); },
         ...(record.body ? { body: {

@@ -244,3 +244,48 @@ test('old in-flight status cannot overwrite the state after an explicit launch',
   assert.equal((await client.status()).state, 'starting');
   assert.equal(queries, 3);
 });
+
+async function skinFixture(t:any){
+  const f=await fixture(t);
+  const metadata=JSON.parse(await readFile(f.metadataPath,'utf8'));
+  metadata.mainClass='net.fabricmc.loader.impl.launch.knot.KnotClient';
+  await writeFile(f.metadataPath,JSON.stringify(metadata));
+  const entries=[];
+  for(let i=0;i<9;i++){
+    const path=join(f.gameDirectory,i===8?'mods/customskinloader.jar':`libraries/fabric-${i}.jar`);
+    await mkdir(resolve(path,'..'),{recursive:true});await writeFile(path,`fixture-${i}`);
+    entries.push({path,sha256:createHash('sha256').update(`fixture-${i}`).digest('hex')});
+  }
+  const manifest={schemaVersion:1,minecraftVersion:'1.21.4',loaderVersion:'0.16.10',
+    mainClass:metadata.mainClass,gameDirectory:f.gameDirectory,libraries:entries.slice(0,8),mod:entries[8]};
+  const path=join(f.runtimeDirectory,'skin-client.json');await writeFile(path,JSON.stringify(manifest));
+  return {...f,manifest,manifestPath:path};
+}
+
+test('verified local-skin instance launches Fabric with the same identity/server and deduplicates a running client',async t=>{
+  const f=await skinFixture(t);
+  assert.equal((await f.client.status()).state,'ready');
+  assert.equal((await f.client.launch()).started,true);
+  const args=f.calls[0].args;
+  assert.ok(args.includes('net.fabricmc.loader.impl.launch.knot.KnotClient'));
+  assert.ok(args.includes('-DFabricMcEmu= net.minecraft.client.main.Main '));
+  assert.ok(args[args.indexOf('-cp')+1].startsWith(f.manifest.libraries[0].path));
+  assert.equal(args.at(-1),'127.0.0.1:25565');assert.equal(args[args.indexOf('--username')+1],'AnimaObserver');
+  f.processes.push({pid:123,kind:'client'});assert.equal((await f.client.launch()).alreadyRunning,true);assert.equal(f.calls.length,1);
+});
+
+test('Fabric replaces vanilla ASM rather than passing duplicate classes on the classpath',async t=>{
+  const f=await skinFixture(t),oldAsm=join(f.runtimeDirectory,'client/libraries/org/ow2/asm/asm/9.6/asm-9.6.jar');
+  await mkdir(resolve(oldAsm,'..'),{recursive:true});await writeFile(oldAsm,'vanilla-asm');
+  f.runtime.client.classpath=oldAsm+delimiter+f.runtime.client.classpath;
+  await writeFile(join(f.runtimeDirectory,'runtime.json'),JSON.stringify(f.runtime));
+  assert.equal((await f.client.launch()).started,true);
+  const args=f.calls[0].args;assert.equal(args[args.indexOf('-cp')+1].includes(oldAsm),false);
+});
+
+test('local-skin launch rejects missing, altered or out-of-scope components without spawning',async t=>{
+  const f=await skinFixture(t);
+  await writeFile(f.manifest.mod.path,'modified');assert.equal((await f.client.launch()).state,'unavailable');
+  f.manifest.mod.path=join(f.root,'outside.jar');await writeFile(f.manifestPath,JSON.stringify(f.manifest));
+  assert.equal((await f.client.launch()).state,'unavailable');assert.equal(f.calls.length,0);
+});

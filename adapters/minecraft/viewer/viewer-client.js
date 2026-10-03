@@ -11,6 +11,29 @@ window.AnimaViewerStart = ({ THREE, TWEEN, Viewer, Vec3, io }) => {
   const label = document.getElementById('status');
   let status, failed = false, disposed = false, renderer, viewer, controls, orbitCamera, socket, frame, generation = -1;
   let viewCleanup = [];
+  const skinNames = new Set(['Sheldon', 'Sherlock', 'Deadpool', 'HuYifei']);
+  let skinTextures = new Map();
+  function applySkin(entity) {
+    const name = entity.username;
+    const mesh = viewer?.entities.entities[entity.id];
+    if (!mesh || entity.name !== 'player' || !skinNames.has(name)) return;
+    const activeViewer = viewer, revision = generation;
+    let entry = skinTextures.get(name);
+    if (!entry) {
+      entry = { texture: undefined, failed: false }; skinTextures.set(name, entry);
+      new THREE.TextureLoader().load(`/skins/${name}.png`, texture => {
+        if (disposed || viewer !== activeViewer || generation !== revision) { texture.dispose(); return; }
+        texture.magFilter = texture.minFilter = THREE.NearestFilter; texture.flipY = false;
+        entry.texture = texture;
+      }, undefined, () => { entry.failed = true; });
+    }
+    mesh.userData ??= {}; mesh.userData.animaSkinName = name;
+    if (entry.texture) mesh.traverse?.(child => {
+      if (child.isSkinnedMesh && child.material) {
+        if (child.material.map !== entry.texture) { child.material.map = entry.texture; child.material.needsUpdate = true; }
+      }
+    });
+  }
   const pageCleanup = [];
   let parentVisible = true;
   const visible = () => parentVisible && !document.hidden;
@@ -44,6 +67,8 @@ window.AnimaViewerStart = ({ THREE, TWEEN, Viewer, Vec3, io }) => {
   }
   function disposeView() {
     const old = viewer; viewer = undefined;
+    const oldSkinTextures = [...skinTextures.values()];
+    skinTextures = new Map();
     for (const cleanup of viewCleanup.splice(0)) quietly(cleanup);
     quietly(() => controls?.dispose()); controls = undefined; orbitCamera = undefined;
     if (!old) return;
@@ -56,6 +81,7 @@ window.AnimaViewerStart = ({ THREE, TWEEN, Viewer, Vec3, io }) => {
       if (!resource || resources.has(resource)) return;
       resources.add(resource); quietly(() => resource.dispose?.());
     };
+    for (const entry of oldSkinTextures) release(entry.texture);
     const material = value => {
       if (!value) return;
       if (Array.isArray(value)) { value.forEach(material); return; }
@@ -179,13 +205,14 @@ window.AnimaViewerStart = ({ THREE, TWEEN, Viewer, Vec3, io }) => {
       if (!hasPosition) { controls.target.copy(target); orbitCamera.position.set(target.x + 5, target.y + 3, target.z + 6); }
       hasPosition = true; lastPositionAt = Date.now(); positionRevision++;
       viewer.updateEntity({ id: 'anima:self', name: 'player', username: npc, height: 1.8, width: 0.6, pos: event.pos, yaw: event.yaw });
+      applySkin({ id: 'anima:self', name: 'player', username: npc });
       // The upstream entity tween skips exact zero yaw.
       if (event.yaw === 0 && viewer.entities.entities['anima:self']) viewer.entities.entities['anima:self'].rotation.y = 0;
     });
     socket.on('viewer-world-ready', event => { if (event.generation === generation) worldReady = true; });
     socket.on('loadChunk', event => { if (viewer && !disposed) { chunkCount++; viewer.addColumn(event.x, event.z, event.chunk); } });
     socket.on('unloadChunk', event => viewer?.removeColumn(event.x, event.z));
-    socket.on('entity', event => { if (viewer && (!event.delete || viewer.entities.entities[event.id])) viewer.updateEntity(event); });
+    socket.on('entity', event => { if (viewer && (!event.delete || viewer.entities.entities[event.id])) { viewer.updateEntity(event); if (!event.delete) applySkin(event); } });
     socket.on('blockUpdate', event => viewer?.setBlockStateId(new Vec3(event.pos.x, event.pos.y, event.pos.z), event.stateId));
     function positionCamera() {
       cameraDirection.copy(orbitCamera.position).sub(target);
@@ -221,7 +248,12 @@ window.AnimaViewerStart = ({ THREE, TWEEN, Viewer, Vec3, io }) => {
         // Translate camera and orbit centre together; preserve the user's orbit/zoom.
         const delta = target.clone().sub(controls.target); orbitCamera.position.add(delta); controls.target.copy(target);
       }
-      controls.update(); if (hasPosition) positionCamera(); viewer.update(); renderer.render(viewer.scene, viewer.camera);
+      controls.update(); if (hasPosition) positionCamera(); viewer.update();
+      // The upstream Steve texture can arrive after our skin; reapply the local
+      // map without recompiling materials or starting duplicate texture loads.
+      for (const [id, mesh] of Object.entries(viewer.entities.entities)) if (mesh.userData?.animaSkinName)
+        applySkin({ id, name: 'player', username: mesh.userData.animaSkinName });
+      renderer.render(viewer.scene, viewer.camera);
       const fresh = hasPosition && Date.now() - lastPositionAt < 5000;
       // Moving NPCs continuously dirty sections. A real rendered terrain mesh
       // is enough to present the scene while the remaining chunks stream in.

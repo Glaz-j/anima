@@ -9,6 +9,8 @@ import { findSafeFood, surfaceTargetAvailable } from './continuous-skills.ts';
 import { copyGatherState } from './survival-actions.ts';
 import { droppedItemSummary } from './entity-observation.ts';
 import { BRIDGE_LIMITS, BRIDGE_MATERIALS } from './bridge-skill.ts';
+import { validateBuild } from './build-skill.ts';
+import { BUILD_LIMITS, compileBuild } from './build-blueprints.ts';
 import { createLocalThreats } from './local-threats.ts';
 import type { MinecraftWorld, BotRecord } from './world.ts';
 
@@ -39,7 +41,7 @@ const REPLAN_CODES = new Set(['jump_arc_blocked', 'jump_out_of_range', 'landing_
   'no_path', 'search_budget', 'movement_budget', 'node_budget', 'read_budget', 'planning_budget',
   'step_blocked', 'head_blocked', 'vertical_only', 'hazard', 'hazardous_landing',
   'unsupported_drop', 'no_progress', 'target_changed', 'target_not_visible', 'target_out_of_range', 'target_occluded',
-  'shore_route_blocked']);
+  'shore_route_blocked', 'build_conflict', 'build_unknown_cell', 'build_missing_material', 'build_unreachable', 'build_passage_blocked', 'build_range_limit']);
 type ReplanRequired = { intentVersion: number; stepIndex: number; receiptId: number; code: string; reason: string };
 function stoppedCode(details: any): string | undefined {
   // A compound skill may successfully approach before discovering a different
@@ -54,6 +56,7 @@ function stoppedCode(details: any): string | undefined {
 
 /** The world timeout leaves the bridge's own deadline time to drain its receipt. */
 export function bodyActionTimeoutMs(action: any) {
+  if (action.type === 'build') return BUILD_LIMITS.sliceMs + 3000;
   if (action.type === 'bridge') return BRIDGE_LIMITS.timeoutMs + 3000;
   if (action.type === 'fish') return action.durationMs + 8000;
   return ['gather', 'craft', 'smelt', 'container'].includes(action.type) ? 45000 : 15000;
@@ -61,6 +64,7 @@ export function bodyActionTimeoutMs(action: any) {
 
 export function validateBodyAction(raw: any) {
   if (!raw || typeof raw !== 'object') throw new ApiError(400, '无效身体技能。');
+  if (raw.type === 'build') { try { return validateBuild(raw); } catch (error:any) { throw new ApiError(400,error.message); } }
   if (raw.type === 'bridge') {
     const { x, z } = coordinates({ x: raw.x, y: 0, z: raw.z });
     const item = typeof raw.item === 'string' ? raw.item.replace(/^minecraft:/u, '') : raw.item ?? 'cobblestone';
@@ -112,6 +116,7 @@ export class MinecraftBody {
   private skillDurations = new Map<string, number[]>();
   private skillStart?: { key: string; position: MovementOrigin; health?: number; food: number };
   private bridges = new Map<number, BridgeProgress>();
+  private buildTotals = new Map<number, number>();
   private stepOrigins = new Map<number, MovementOrigin>();
   private encounter?: { id: string; origin: MovementOrigin; exitRange: number; clearSince?: number;
     blocked?: Record<string, ReactionBlocked>; unproductive?: Record<string, number> };
@@ -231,7 +236,7 @@ export class MinecraftBody {
     const intent = { id: randomUUID(), version: snapshot.version + 1, goal: { steps, policy, anchor, terminal, label: String(raw.label ?? 'NPC目标').slice(0, 160) },
       expiresAt: Date.now() + ttlMs, allowedReactions: reactions };
     const result = resume ? this.controller.resume(intent) : this.controller.submit(intent);
-    if (result.accepted) { this.completed.clear(); this.mined.clear(); this.gathering.clear(); this.gatherStates.clear(); this.unproductive.clear(); this.confirmationWait.clear(); this.lastStepReceipt.clear(); this.bridges.clear(); this.stepOrigins.clear(); this.hazard = undefined; this.quietUntil = 0; this.controller.tick(); }
+    if (result.accepted) { this.completed.clear(); this.mined.clear(); this.gathering.clear(); this.gatherStates.clear(); this.unproductive.clear(); this.confirmationWait.clear(); this.lastStepReceipt.clear(); this.bridges.clear(); this.buildTotals.clear(); this.stepOrigins.clear(); this.hazard = undefined; this.quietUntil = 0; this.controller.tick(); }
     return { ...result, intentId: result.accepted ? intent.id : undefined, status: result.accepted ? 'accepted' : 'rejected',
       note: '接收不代表完成；身体使用独立生命周期，停止思考不会撤销此目标。', control: this.snapshot() };
   }
@@ -288,6 +293,15 @@ export class MinecraftBody {
     if (step.type === 'wait' || step.type === 'move') return step.ms;
     const history = this.skillDurations.get(step.type) ?? [];
     const sorted = [...history].sort((a, b) => a - b), measured = sorted[Math.floor(sorted.length / 2)];
+    if (step.type === 'build') {
+      let total=this.buildTotals.get(index);
+      if(total===undefined){total=compileBuild(step.blueprint,step).blocks.length;this.buildTotals.set(index,total);}
+      const receipt=this.controller.snapshot().recentReceipts.find(r=>r.id===this.lastStepReceipt.get(index));
+      const details=(receipt?.result as any)?.details;
+      const matched=Number.isInteger(details?.matched)?Math.max(0,Math.min(total,details.matched)):0;
+      const perBlock=measured===undefined?1000:measured/Math.max(1,details?.placed??step.batchBlocks??BUILD_LIMITS.sliceBlocks);
+      return Math.max(100,(total-matched)*Math.max(500,Math.min(10000,perBlock)));
+    }
     if (step.type === 'gather') return Math.max(0, step.count - (this.mined.get(index) ?? 0)) * (measured ?? 4000);
     if (['goto', 'travel', 'jump_to', 'bridge'].includes(step.type) && Number.isFinite(step.x) && Number.isFinite(step.z)) {
       const distance = Math.hypot(step.x - position.x, step.z - position.z, (step.y ?? position.y) - position.y);
@@ -533,7 +547,7 @@ export class MinecraftBody {
     const moved = start?.key === receipt.key && current && (unstartedTravel || blockedShore || blockedRetreat
       ? Math.hypot(current.x - start.position.x, current.z - start.position.z)
       : current.distanceTo(start.position)) >= .15;
-    return !!(moved || details.minedBlocks > 0 || details.spent > 0 || details.inventoryIncreased === true
+    return !!(moved || details.minedBlocks > 0 || details.spent > 0 || result?.action?.type === 'build' && details.placed > 0 || details.inventoryIncreased === true
       || details.consumptionConfirmed === true || details.killConfirmed === true
       || Number.isFinite(details.healthAfter) && Number.isFinite(details.healthBefore) && details.healthAfter < details.healthBefore
       || start?.key === receipt.key && Number.isFinite(details.healthAfter) && Number.isFinite(start.health) && details.healthAfter < start.health!
@@ -617,6 +631,7 @@ export class MinecraftBody {
           else if (receipt.status === 'completed' && step?.type !== 'gather') {
             const finished = native?.type === 'combat' ? details.killConfirmed === true || details.stoppedReason === 'target_dead_observed' || (typeof details.healthAfter === 'number' && details.healthAfter <= 0)
               : native?.type === 'surface' ? (native.target ? details.shoreReached === true : details.dryGround === true || details.surfaceReached === true)
+              : native?.type === 'build' ? details.reached === true
               : native?.type === 'jump_to' ? details.reached === true && details.landed === true
               : native?.type === 'eat' ? details.consumptionConfirmed === true : true;
             if (finished) this.completed.add(index);

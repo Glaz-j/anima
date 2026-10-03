@@ -9,6 +9,7 @@ import { BodyController } from '../packages/bridge/src/body-controller.ts';
 import { WorldMemory } from '../packages/npc-core/src/world-memory.ts';
 import { loadWorldPersona } from '../packages/npc-core/src/world-persona.ts';
 import { compactBodyControl, compactObservation, currentBodyContext, runWorldAgent, type WorldAgentPort } from '../packages/pi-runtime/src/world-agent.ts';
+import { describeBuild } from '../adapters/minecraft/src/build-blueprints.ts';
 
 function runtime(responses: any[]) {
   const models = createModels(), faux = fauxProvider(); models.setProvider(faux.provider); faux.setResponses(responses);
@@ -64,6 +65,25 @@ const plan = (expectedVersion = 0) => ({ expectedVersion, label: '去采集木�
   ttlMs: 30000, reactions: ['surface', 'eat'], policy: { retreatHealth: 7, chaseRange: 4 } });
 const call = (name: string, args: any) => fauxAssistantMessage(fauxToolCall(name, args), { stopReason: 'toolUse' });
 const done = () => fauxAssistantMessage(fauxText('继续工作。'), { stopReason: 'stop' });
+
+test('construction blueprint query is read-only and the brain can authorize persistent build work',async t=>{
+  const f=await fixture(t);let queries=0;
+  f.port.constructionPlan=args=>{queries++;return describeBuild(args);};
+  const step={type:'build',blueprint:'village-house',origin:{x:0,y:64,z:0},rotation:90,palette:'spruce'};
+  const result=await runWorldAgent({...f,instruction:'建造村屋',runtime:runtime([
+    call('construction_plan',{blueprint:step.blueprint,origin:step.origin,rotation:step.rotation,palette:step.palette}),call('body_plan',{...plan(),steps:[step]}),done()])});
+  assert.equal(queries,1);
+  assert.equal(f.actions.length,0);assert.deepEqual(f.submitted[0].steps,[step]);
+  assert.equal(f.started[0].signal.aborted,false);assert.equal(result.actions.length,0);
+});
+
+test('compacted building receipts retain partial coverage and outstanding materials',()=>{
+  const compact=compactBodyControl({version:1,recentReceipts:[{id:3,status:'failed',result:{action:{type:'build'},
+    details:{placed:12,matched:105,total:229,reached:false,stoppedReason:'build_missing_material',missingMaterials:{oak_planks:113}}}}]});
+  assert.equal(compact.recentReceipts[0].details.matched,105);
+  assert.equal(compact.recentReceipts[0].details.reached,false);
+  assert.deepEqual(compact.recentReceipts[0].details.missingMaterials,{oak_planks:113});
+});
 
 test('body_plan acknowledges immediately and persistent execution survives the completed reasoning turn', async t => {
   const f = await fixture(t);

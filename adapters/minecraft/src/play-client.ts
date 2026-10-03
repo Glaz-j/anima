@@ -2,6 +2,7 @@ import { spawn, execFile, type ChildProcess, type SpawnOptions } from 'node:chil
 import { promisify } from 'node:util';
 import { open, readFile, stat, mkdir, appendFile } from 'node:fs/promises';
 import { resolve, join, relative, isAbsolute, basename, delimiter } from 'node:path';
+import { createHash } from 'node:crypto';
 
 export type PlayClientMode = 'native' | 'hmcl';
 export interface PlayClientOptions {
@@ -41,6 +42,7 @@ interface PreparedClient extends ProcessScope { executable: string; args: string
 // No account store is opened, no credentials are copied, and authentication is not changed.
 const OBSERVER = 'AnimaObserver';
 const OBSERVER_UUID = '9b797b28c1dd553e9ab2f17ae44732f2';
+const FABRIC_MAIN = 'net.fabricmc.loader.impl.launch.knot.KnotClient';
 const pendingLaunches = new Map<string, Promise<PlayClientLaunch>>();
 const execFileAsync = promisify(execFile);
 const STATUS_CACHE_MS = 10_000;
@@ -66,7 +68,7 @@ async function windowsProcesses(scope: ProcessScope): Promise<RunningProcess[]> 
     '$ErrorActionPreference = "Stop";',
     '$result = @(Get-CimInstance Win32_Process -Filter "Name = \'java.exe\' OR Name = \'javaw.exe\'" | ForEach-Object {',
     '  $line = $_.CommandLine;',
-    '  if ($line -and $line.IndexOf($env:ANIMA_PLAY_GAME_DIR, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and $line.Contains("net.minecraft.client.main.Main")) {',
+    '  if ($line -and $line.IndexOf($env:ANIMA_PLAY_GAME_DIR, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and ($line.Contains("net.minecraft.client.main.Main") -or $line.Contains("net.fabricmc.loader.impl.launch.knot.KnotClient"))) {',
     '    [pscustomobject]@{pid=[int]$_.ProcessId;kind="client"}',
     '  } elseif ($line -and $line.IndexOf($env:ANIMA_PLAY_LAUNCHER_JAR, [StringComparison]::OrdinalIgnoreCase) -ge 0) {',
     '    [pscustomobject]@{pid=[int]$_.ProcessId;kind="launcher"}',
@@ -138,7 +140,20 @@ export class PlayClient {
     const gameDirectory = join(launcherDirectory, 'instances', this.instance);
     const versionDirectory = join(gameDirectory, 'versions', this.instance);
     const metadata = await jsonFile(join(versionDirectory, `${this.instance}.json`));
-    if (metadata.id !== this.instance || metadata.mainClass !== 'net.minecraft.client.main.Main' || metadata.inheritsFrom) throw new Error('该入口仅支持已准备的原生客户端。');
+    if (metadata.id !== this.instance || !['net.minecraft.client.main.Main', FABRIC_MAIN].includes(metadata.mainClass) || metadata.inheritsFrom) throw new Error('该入口仅支持已准备的原生或本地皮肤客户端。');
+    const fabricLibraries: string[] = [];
+    if (metadata.mainClass === FABRIC_MAIN) {
+      const skin = await jsonFile(join(runtimeDirectory, 'skin-client.json'));
+      if (skin.schemaVersion !== 1 || skin.minecraftVersion !== this.version || skin.loaderVersion !== '0.16.10'
+        || skin.mainClass !== FABRIC_MAIN || resolve(String(skin.gameDirectory)) !== gameDirectory
+        || !Array.isArray(skin.libraries) || skin.libraries.length !== 8) throw new Error('本地皮肤客户端配置无效，请重新准备。');
+      for (const entry of [...skin.libraries, skin.mod]) {
+        const path = inside(gameDirectory, entry?.path);
+        if (!path.endsWith('.jar') || !/^[a-f0-9]{64}$/u.test(entry.sha256)
+          || createHash('sha256').update(await readFile(path)).digest('hex') !== entry.sha256) throw new Error('本地皮肤组件校验失败，请重新准备。');
+      }
+      fabricLibraries.push(...skin.libraries.map((entry: any) => inside(gameDirectory, entry.path)));
+    }
     await Promise.all([exists(executable), exists(launcherJar), exists(gameDirectory, true), exists(join(versionDirectory, `${this.instance}.jar`))]);
     if (this.mode === 'hmcl') {
       const gameArgs = metadata.arguments?.game;
@@ -156,7 +171,8 @@ export class PlayClient {
     await Promise.all([exists(natives, true), exists(assets, true), exists(join(assets, 'indexes', `${client.assetIndex}.json`)), ...libraries.map((path: string) => exists(path))]);
     const args = ['-Xms512M', '-Xmx2G', `-Djava.library.path=${natives}`, `-Djna.tmpdir=${natives}`,
       `-Dorg.lwjgl.system.SharedLibraryExtractPath=${natives}`, '-Dminecraft.launcher.brand=AnimaLocal', '-Dminecraft.launcher.version=0.1',
-      '-cp', libraries.join(delimiter), client.mainClass, '--username', OBSERVER, '--version', this.instance,
+      ...(fabricLibraries.length ? ['-DFabricMcEmu= net.minecraft.client.main.Main '] : []),
+      '-cp', [...fabricLibraries, ...libraries.filter(path => !fabricLibraries.length || !/[\\/]org[\\/]ow2[\\/]asm[\\/]/u.test(path))].join(delimiter), metadata.mainClass, '--username', OBSERVER, '--version', this.instance,
       '--gameDir', gameDirectory, '--assetsDir', assets, '--assetIndex', String(client.assetIndex),
       '--uuid', OBSERVER_UUID, '--accessToken', '0', '--userType', 'legacy', '--versionType', 'release',
       '--width', '1280', '--height', '720', '--quickPlayMultiplayer', this.serverAddress];

@@ -5,6 +5,7 @@ import { approachTarget } from './approach.ts';
 import { assertInventorySessionUsable } from './craft-sync.ts';
 import { consumeHeldItem } from './consumption-action.ts';
 import { runBridgeSkill } from './bridge-skill.ts';
+import { runBuildSkill } from './build-skill.ts';
 import { checkSignal, clearLine, closestPoint, entityHealth, entityVisible, haltNative, meleeTarget, nativeWalkTo, runNativeAction } from './native-actions.ts';
 
 export const CONTINUOUS_SKILL_LIMITS = Object.freeze({ tickMs: 50, combatMs: 10000, surfaceMs: 10000,
@@ -425,8 +426,8 @@ async function eat(bot: any, signal: AbortSignal) {
 export async function runContinuousSkill(bot: any, action: any, signal: AbortSignal, emit: (type: string, data: any) => void = () => {}) {
   const kind = action?.type;
   const stop = () => { haltNative(bot); bot.jumpQueued = false; };
-  if (kind === 'bridge') {
-    try { checkSignal(signal); return await runBridgeSkill(bot, action, signal, emit); }
+  if (kind === 'bridge' || kind === 'build') {
+    try { checkSignal(signal); return kind === 'build' ? await runBuildSkill(bot, action, signal, emit) : await runBridgeSkill(bot, action, signal, emit); }
     finally { stop(); }
   }
   if (!['combat', 'surface', 'jump_to', 'retreat', 'eat', 'pickup'].includes(kind)) {

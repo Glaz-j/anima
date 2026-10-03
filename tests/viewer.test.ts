@@ -173,7 +173,11 @@ test('third-person client follows real motion and cleans up scoped workers, asyn
       material: new THREE.MeshLambertMaterial(), sectionsOutstanding: new Set(), sectionMeshs: {} as any };
     entities = { entities: {} as any }; scene = new THREE.Scene();
     constructor() { viewCount++; view = this; } resetAll() { throw new Error('cleanup must not post reset to terminated workers'); } setVersion() { return true; }
-    updateEntity(e: any) { this.entities.entities[e.id] = { rotation: { y: e.yaw } }; }
+    updateEntity(e: any) {
+      const mesh = this.entities.entities[e.id] ?? new THREE.Group();
+      if (!mesh.children.length) mesh.add(new THREE.SkinnedMesh(new THREE.BufferGeometry(), new THREE.MeshLambertMaterial()));
+      mesh.rotation.y = e.yaw ?? mesh.rotation.y; this.entities.entities[e.id] = mesh;
+    }
     addColumn() {} removeColumn() {} setBlockStateId() {} update() {}
   }
   const label = { dataset: {}, textContent: '' };
@@ -191,8 +195,14 @@ test('third-person client follows real motion and cleans up scoped workers, asyn
   socket.emit('viewer-reset', { npc: 'Sheldon', generation: 1, version: '1.21.4' });
   assert.equal(viewCount, 1); assert.equal(disposed, 0);
   socket.emit('position', { npc: 'Sheldon', generation: 1, pos: { x: 0, y: -20, z: 0 }, yaw: 0 });
+  const skinLoad = textureLoads.find(load => load.url === '/skins/Sheldon.png');
+  assert.ok(skinLoad, 'The selected NPC uses its bundled skin.');
+  const skinTexture = new THREE.Texture(); let skinDisposals = 0;
+  skinTexture.addEventListener('dispose', () => skinDisposals++); skinLoad.ready(skinTexture);
   socket.emit('loadChunk', { x: 0, z: 0, chunk: '{}' }); socket.emit('viewer-world-ready', { generation: 1 });
   frames.shift()!(); assert.equal(messages.at(-1).status, 'live'); assert.equal(messages.at(-1).origin, 'http://localhost:18791');
+  assert.equal(view.entities.entities['anima:self'].children[0].material.map, skinTexture);
+  assert.equal(textureLoads.filter(load => load.url === '/skins/Sheldon.png').length, 1);
   assert.equal(messages.at(-1).sessionId, 'camera-123');
   control.object.position.set(8, -16.9, -2); // A user's orbit and zoom.
   socket.emit('position', { npc: 'Sheldon', generation: 1, pos: { x: 3, y: -19, z: -4 }, yaw: 0 });
@@ -272,21 +282,23 @@ test('third-person client follows real motion and cleans up scoped workers, asyn
 
   // A dimension reset invalidates all old worker errors and delayed asset results.
   const old = view, oldWorkers = [...view.world.workers], oldError = oldWorkers[0].listeners.error;
+  assert.equal(skinDisposals, 1, 'A replaced scene releases the original skin exactly once.');
   old.world.updateTexturesData(); assert.equal(fetches.length, 1);
   socket.emit('viewer-reset', { npc: 'Sheldon', generation: 2, version: '1.21.4' });
   assert.equal(viewCount, 4); assert.equal(fetches[0].options.signal.aborted, true);
   assert.equal(oldWorkers[0].onmessage, null); assert.equal(oldWorkers[0].listeners.error, undefined);
   const resetMessages = messages.length;
-  oldError({ message: 'late worker error' }); textureLoads[0].error(new Error('late texture error'));
+  const terrainLoads = () => textureLoads.filter(load => !load.url.startsWith('/skins/'));
+  oldError({ message: 'late worker error' }); terrainLoads()[0].error(new Error('late texture error'));
   let lateDisposed = 0; const lateTexture = new THREE.Texture(); lateTexture.addEventListener('dispose', () => lateDisposed++);
-  textureLoads[0].ready(lateTexture);
+  terrainLoads()[0].ready(lateTexture);
   fetches[0].resolve({ ok: true, json: async () => ({ marker: 'old dimension' }) }); await turn();
   assert.equal(lateDisposed, 1); assert.equal(old.world.material.map, null);
   assert.equal(oldWorkers[0].sent.length, 0); assert.equal(messages.length, resetMessages);
   // The current view still receives its own assets normally.
   view.world.updateTexturesData();
   const texture = new THREE.Texture(); let textureDisposals = 0; texture.addEventListener('dispose', () => textureDisposals++);
-  textureLoads[1].ready(texture); fetches[1].resolve({ ok: true, json: async () => ({ marker: 'current dimension' }) }); await turn();
+  terrainLoads()[1].ready(texture); fetches[1].resolve({ ok: true, json: async () => ({ marker: 'current dimension' }) }); await turn();
   assert.equal(view.world.material.map, texture); assert.equal(view.world.workers[0].sent[0].json.marker, 'current dimension');
 
   // A render exception is caught once; a fresh reset can recover without a loop.

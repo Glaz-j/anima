@@ -3,7 +3,7 @@ export type ExamStatus = 'passed' | 'failed' | 'unsupported' | 'infra-error' | '
 export type ExamArchitecture = 'serial' | 'parallel' | 'dual';
 export interface ExamCandidateMetadata { model?: { provider?: string; id: string }; controller?: string }
 export interface ExamSourceIdentity { gitHead: string | null; dirty: boolean | null; workingTreeId: string; capturedAt: string }
-export type ExamCategory = 'combat-single' | 'combat-multiple' | 'parkour-empty' | 'parkour-items' | 'craft' | 'gather' | 'navigate' | 'water-rescue' | 'eat-resume' | 'interrupt-resume';
+export type ExamCategory = 'combat-single' | 'combat-multiple' | 'parkour-empty' | 'parkour-items' | 'craft' | 'gather' | 'navigate' | 'water-rescue' | 'eat-resume' | 'interrupt-resume' | 'construct';
 export type Capability = 'server-player-nbt' | 'server-statistics' | 'server-entities' | 'server-blocks' | 'server-clock' | 'isolated-world';
 export interface Checkpoint { center: Vec; radius: number; grounded: boolean }
 export interface EnemySpec { type: 'zombie' | 'skeleton'; position: Vec; tag: string }

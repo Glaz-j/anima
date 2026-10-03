@@ -21,6 +21,8 @@ export interface WorldAgentPort {
   observe(): unknown | Promise<unknown>;
   execute(action: any, taskId: string, signal: AbortSignal): Promise<any>;
   scenarioContext?: () => unknown | Promise<unknown>;
+  /** Public construction templates; no privileged terrain or inventory reads. */
+  constructionPlan?: (options: any) => unknown | Promise<unknown>;
   /** Only this actor's perceived events; the returned cleanup must be idempotent. */
   subscribe?: (listener: (event: WorldPerceptionEvent) => void) => () => void;
   /** Interrupt the current body action without aborting this reasoning task. */
@@ -159,8 +161,9 @@ export function compactBodyControl(raw: any): any {
           ...(details?.prerequisites ? [['prerequisites', JSON.parse(boundedToolJson(details.prerequisites, 900))]] : []),
           ...['reached', 'partial', 'landed', 'shoreReached', 'killConfirmed', 'inventoryConfirmed', 'consumptionConfirmed']
             .filter(key => typeof details?.[key] === 'boolean').map(key => [key, details[key]]),
-          ...['spent', 'placed', 'minedBlocks'].filter(key => Number.isFinite(details?.[key]) && details[key] >= 0)
+          ...['spent', 'placed', 'minedBlocks', 'matched', 'total'].filter(key => Number.isFinite(details?.[key]) && details[key] >= 0)
             .map(key => [key, details[key]]),
+          ...(details?.missingMaterials ? [['missingMaterials',JSON.parse(boundedToolJson(details.missingMaterials,450))]] : []),
           ...['navigation', 'travel', 'approach', 'movement'].filter(key => compactMovementResult(details?.[key]))
             .map(key => [key, compactMovementResult(details[key])]),
         ]),
@@ -385,6 +388,10 @@ export const worldActionParameters = Type.Union([
 const bodyVersion = Type.Integer({ minimum: 0, description: '必须使用最近观察或body_status返回的control.version；不可猜测或擅自递增。' });
 const bodyReactions = Type.Array(Type.Union(['surface', 'eat', 'defend', 'flee'].map(value => Type.Literal(value))), { maxItems: 4, uniqueItems: true });
 const bodySkillParameters = Type.Union([
+  Type.Object({type:Type.Literal('build'),blueprint:Type.Union(['village-house','railed-bridge','courtyard-wall','watchtower','workshop','garden-pavilion'].map(value=>Type.Literal(value))),
+    origin:Type.Object({x:Type.Integer(),y:Type.Integer(),z:Type.Integer()}),rotation:Type.Optional(Type.Union([0,90,180,270].map(value=>Type.Literal(value)))),
+    palette:Type.Optional(Type.Union([Type.Literal('oak'),Type.Literal('spruce')])),batchBlocks:Type.Optional(Type.Integer({minimum:1,maximum:12}))},
+    {additionalProperties:false,description:'按固定建筑蓝图真实生存施工；origin是地基方块坐标。先观察平坦、空闲工地并准备足够材料。每时间片最多放12块，身体续建直到验收完成；已建方块不会重复消耗。不会拆除冲突方块、传送或自动补给。材料、冲突、站位失败后重规划。'}),
   ...worldActionParameters.anyOf.filter((schema: any) => !['scan', 'recipes', 'say', 'broadcast', 'stop', 'posture'].includes(schema.properties?.type?.const)),
   Type.Object({ type: Type.Literal('jump_to'), ...position, durationMs: Type.Optional(Type.Integer({ minimum: 50, maximum: 5000 })) },
     { additionalProperties: false, description: '从干燥地面做一次短跳：起点到目标水平距离≤3.6格，垂直高差绝对值≤1格。x/y/z是人物脚部落点，完整支撑方块的顶面通常为方块y+1；落点必须是当前可见且加载的真实平台，有支撑和身体空间。不能直接跳上高2格的平台，不会自动造支撑或拆障碍。完成必须同时reached和landed，以实际回执为准。' }),
@@ -544,7 +551,7 @@ export async function runWorldAgent(options: WorldAgentOptions) {
     // A partial/cancelled bridge or gather can really change the world. Spent
     // items alone are not proof of placement, and accepted plans are not work.
     const count = (value: any) => Number.isInteger(value) && value >= 0 ? value : 0;
-    const blockChanges = type === 'bridge' ? count(details.placed) : type === 'gather' ? count(details.minedBlocks)
+    const blockChanges = type === 'bridge' || type === 'build' ? count(details.placed) : type === 'gather' ? count(details.minedBlocks)
       : type === 'place' ? Number(details.placementConfirmed === true || receipt.status === 'completed')
         : type === 'dig' ? Number(receipt.status === 'completed') : 0;
     const error = receipt.error ?? (status !== 'completed' ? receipt.reason ?? details.stoppedReason : undefined);
@@ -904,6 +911,13 @@ export async function runWorldAgent(options: WorldAgentOptions) {
     return toolResult({ ...receipt, ...(memorySaved === undefined ? {} : { memorySaved }), ...(firstPlan ? { firstPlan } : {}) });
   };
   const tools: AgentTool<any, any>[] = [
+    ...(port.constructionPlan ? [{ name:'construction_plan',label:'查看建筑蓝图与材料清单',
+      description:'只查询公共建筑模板的尺寸、门洞、登高通路和材料数量，不开工、不续租，也不证明工地或库存满足条件。取得清单后自己选择工地、收集/合成材料，再用body_plan的build步骤施工。',
+      parameters:Type.Object({blueprint:Type.Union(['village-house','railed-bridge','courtyard-wall','watchtower','workshop','garden-pavilion'].map(v=>Type.Literal(v))),
+        origin:Type.Optional(Type.Object({x:Type.Integer(),y:Type.Integer(),z:Type.Integer()})),
+        rotation:Type.Optional(Type.Union([0,90,180,270].map(v=>Type.Literal(v)))),palette:Type.Optional(Type.Union([Type.Literal('oak'),Type.Literal('spruce')]))},{additionalProperties:false}),
+      async execute(_id:string,args:any){check();const result=await port.constructionPlan!(args);check();return toolResult(result);}
+    } as AgentTool<any,any>] : []),
     ...(port.body ? [
       { name: 'body_status', label: '查看持续身体任务', description: '读取自己的身体控制版本、目标、技能、进度和最近回执；不修改或中断身体。', parameters: Type.Object({}),
         async execute() { check(); const raw = await port.body!.status(); receiveBodyControl(raw);
@@ -1092,7 +1106,7 @@ export async function runWorldAgent(options: WorldAgentOptions) {
             recentProgress: memory.progressContext(state, progress.situationChanges, 2600, progress),
             recentGoalHistory: memory.goalHistoryContext(),
             teammateStatements: memory.entries.filter(entry => entry.kind === 'hearsay').slice(-4).map(entry => ({ text: entry.text, time: entry.time })),
-            capabilities: port.body ? '通过body_plan提交有版本和有效期的持续技能序列及surface/eat/defend/flee应急授权；body_status查进度，cancel_body撤销。技能包括移动、采集、合成、物品交互、combat近战时间片、surface浮水上岸、jump_to短跳、bridge预算内水平搭桥和eat安全食用。身体独立于思考运行，accepted不是完成或击杀。仅有本角色感知，没有队友私有信息；本次只读审议不直接更新身体目标。'
+            capabilities: port.body ? '通过body_plan提交有版本和有效期的持续技能序列及surface/eat/defend/flee应急授权；body_status查进度，cancel_body撤销。技能包括移动、采集、合成、物品交互、combat近战时间片、surface浮水上岸、jump_to短跳、bridge预算内水平搭桥、build模板建筑和eat安全食用。construction_plan可查询村屋、护栏桥、围墙、瞭望塔、工坊、凉亭的材料和尺寸，仍须自己观察工地、获取材料；不会自动生成物品。身体独立于思考运行，accepted不是完成或击杀。仅有本角色感知，没有队友私有信息；本次只读审议不直接更新身体目标。'
               : '可以观察、交流、挖掘、放置、合成、采集、操作真实物品。travel(x,z)走向自己选择的陆地区域，不必预先计算每一步Y；approach接近已见对象。fish对自选的可见水点使用真实鱼竿尝试一竿，不自动找水。attack(follow=true)可在所选总时限内接近并攻击同一可见目标。posture(tread_water)可限时维持身体空闲及思考时的浮水按键，其他动作优先，不保证换气或上岸，水域仍需自行操作。身体工具检查基本距离和碰撞并返回实际结果；未知路线可做有界尝试，不需先证明一定成功。没有自动资源路线或队友私有信息。',
             runtime, signal: reviewController.signal });
           for (const key of Object.keys(usage) as (keyof typeof usage)[]) usage[key] += goalReview.usage[key] || 0;
@@ -1148,6 +1162,7 @@ export async function runWorldAgent(options: WorldAgentOptions) {
             : '当前采用独立双循环：你负责目标、人格偏好和应急授权；本地身体持续执行。')
           + '优先用body_plan提交有界技能序列，body_status查进度，cancel_body撤销。每次修改必须携带你已看到的control.version作为expectedVersion，不可猜测。accepted仅表示授权接收，绝不是资源获取、技能完成或击杀证据。',
         'body_plan修改不同目标时会替换旧目标；原目标还在有效推进时可以保留它并结束思考。相同steps/policy/reactions默认仅续租，不改版本、不重启或清空进度；只有明确从头再做才用restart=true。steps按顺序执行；reactions决定身体可以自行浮水、进食、防卫或撤退，policy阈值表达你的人格偏好。combat的durationMs只是单次交战时间片，时间片结束会在目标ttlMs内续执行同一步，直到真实确认击杀才推进；surface带target同样必须实际到岸才推进，不能把时间片结束当作完成。',
+        ...(port.constructionPlan ? ['建筑工作可先调用construction_plan查询材料与占地，再选择已观察且满足支撑、空间和库存要求的工地，提交build步骤。模板包括village-house、railed-bridge、courtyard-wall、watchtower、workshop、garden-pavilion。build一次回执中的placed/matched只是局部进度；身体会持续续建，直到reached=true才完成。缺材料或地形冲突时读取实际失败，补给或重新选址；不得把accepted、蓝图或部分覆盖当作建成。'] : []),
         ...(continuity && port.body.append ? [(throughput ? '身体执行时可以提前准备后续工作：control.planningNeeded表示预计工作时间不足以覆盖规划耗时，或租期将尽。' : '身体执行时可以提前准备后续工作：control.planningNeeded表示剩余步骤较少或租期将尽。') + '已有明确可行的后续步骤时，优先用body_append补充，再做非必要聊天或记忆；不要等身体停下才开始想。原目标失效或需要改方向时用body_plan替换。一次可以安排多个有依据的步骤，但不要编造未观察的资源或保证未知路线；有理由等待时仍可选择不追加。追加后的版本变化不表示旧技能被重启，旧版本回执可能仍属于同一个intent.id的连续执行。'] : []),
         '对于当前观察已经足够确定、无需中间重新选目标的连续短动作，一次提交有界多步计划，让身体接续执行，避免每做一步都等待下一次模型回复。只在后续选择确实依赖新的观测或失败结果时分段；不要猜测未观察的地形，也不要为延长行动而重复已完成步骤。已接受且仍有效的计划可以继续运行，你可结束思考或处理下一项规划，不必反复查询不变的进度。',
         'control.workCompleted=true或goalStatus=completed表示工作步骤已经完成；intent仍在可能只表示尚未过期的应急策略授权，不要因此重新提交已完成的工作。任务完成后反应策略可在原ttlMs内继续保护身体；目标过期、cancel_body、死亡或人工停止仍会撤销授权。',

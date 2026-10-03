@@ -1,0 +1,23 @@
+{
+  "format": "Minecraft Java classic 64x64 RGBA",
+  "license": "CC0-1.0",
+  "creator": "Anima",
+  "skins": [
+    {
+      "name": "Sheldon",
+      "file": "Sheldon.png"
+    },
+    {
+      "name": "Sherlock",
+      "file": "Sherlock.png"
+    },
+    {
+      "name": "Deadpool",
+      "file": "Deadpool.png"
+    },
+    {
+      "name": "HuYifei",
+      "file": "HuYifei.png"
+    }
+  ]
+}

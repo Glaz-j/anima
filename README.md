@@ -117,6 +117,8 @@ npm run example:pi
 
 默认启用双循环：pi 规划有期限的目标，本地身体持续执行技能并处理明确授权的自保；模型思考结束不会自动停止身体。人工停止、目标替换与到期均撤销旧授权。接口与控制权约定见 [身体控制契约](docs/body-controller-contract.md)。独立的 [小型技能考场](docs/minecraft-skill-exam.md) 在 25575 端口测试战斗、跑酷、搭桥、采集和中断恢复，区分技能参考计划与完整 Agent 成绩，不改动 25565 的生存世界。
 
+[生存建造与建筑考试](docs/minecraft-building.md) 提供村屋、景观桥、围墙、瞭望塔、工坊和凉亭六种持续施工模板，以及方向／材料变化和水沟搭桥题。NPC 可查询材料后通过 `body_plan` 施工，真实消耗自己的背包；`npm run minecraft:build-exam -- run --task all` 在独立考场复验。四套原创皮肤默认用于观察页；`npm run minecraft:skin-client` 为隔离 Java 实例安装本地皮肤支持。
+
 本机已配置并验证 EasyCLIProxyAPI 的 pi 工具调用，兼容接口地址为 `http://127.0.0.1:8317/v1`。项目通过 `ANIMA_*` 显式选择接口，未设置时仍读取本机 pi 的原有 provider；协作者需要准备自己的模型配置。示例见 `.env.example`，设计边界见 [世界接入工作说明](docs/world-integration-brief.md)。
 
 ### 分享代码

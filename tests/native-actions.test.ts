@@ -19,6 +19,18 @@ import { action } from '../adapters/minecraft/src/validation.ts';
 import { MinecraftWorld } from '../adapters/minecraft/src/world.ts';
 import { entityHealth, entityVisible, meleeTarget, nativeWalkTo, runNativeAction, solveBowShot } from '../adapters/minecraft/src/native-actions.ts';
 
+test('placement tries an exposed side when the first solid support has an occluded top face',async()=>{
+  const bot=fakeBot();bot.entity.position=new Vec3(-1.5,64,.5);let placed=false,chosen:any;
+  bot.blockAt=(p:Vec3)=>({name:placed&&p.equals(new Vec3(0,65,0))?'stone':
+    p.equals(new Vec3(0,64,0))||p.equals(new Vec3(1,65,0))?'stone':'air',
+    boundingBox:p.equals(new Vec3(0,64,0))||p.equals(new Vec3(1,65,0))||placed&&p.equals(new Vec3(0,65,0))?'block':'empty',position:p});
+  bot.world.raycast=(eye:Vec3,direction:Vec3,distance:number)=>eye.plus(direction.scaled(distance+.03)).y<65.3?{name:'stone'}:null;
+  bot._placeBlockWithOptions=async(reference:any,face:Vec3)=>{chosen={reference:reference.position,face};placed=true;};
+  const result:any=await runNativeAction(bot,{type:'place',x:0,y:65,z:0,item:'stone'},new AbortController().signal);
+  assert.equal(result.placementConfirmed,true);assert.ok(chosen.reference.equals(new Vec3(1,65,0)));
+  assert.ok(chosen.face.equals(new Vec3(-1,0,0)));
+});
+
 function fakeBot() {
   const bot: any = new EventEmitter();
   bot._client = new EventEmitter();
@@ -45,6 +57,20 @@ function fakeBot() {
   bot.blockAt = (position: Vec3) => ({ name: position.y === 63 ? 'stone' : 'air', boundingBox: position.y === 63 ? 'block' : 'empty', position });
   return bot;
 }
+
+test('ascending a full riser lifts before forward input; cancellation releases the takeoff',async()=>{
+  const bot=fakeBot(),abort=new AbortController();
+  bot.entity.position=new Vec3(.5,64,.5);
+  bot.blockAt=(p:Vec3)=>({name:p.floored().y<64||p.floored().x===1&&p.floored().y===64?'stone':'air',
+    boundingBox:p.floored().y<64||p.floored().x===1&&p.floored().y===64?'block':'empty',position:p.floored()});
+  let pressedForward=false,started!:()=>void;
+  const takeoff=new Promise<void>(r=>{started=r;});
+  const original=bot.setControlState;
+  bot.setControlState=(key:string,value:boolean)=>{original(key,value);if(key==='forward'&&value)pressedForward=true;if(key==='jump'&&value)started();};
+  const job=nativeWalkTo(bot,new Vec3(1.5,65,.5),abort.signal,.25);
+  await takeoff;await delay(25);assert.equal(pressedForward,false,'Do not push into the riser during low takeoff ticks');
+  abort.abort();await assert.rejects(job);assert.equal(bot.getControlState('jump'),false);assert.equal(bot.getControlState('forward'),false);
+});
 
 async function fixture(bot = fakeBot()) {
   const directory = await mkdtemp(join(tmpdir(), 'anima-native-'));

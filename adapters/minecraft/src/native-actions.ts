@@ -103,6 +103,19 @@ function clearLineFrom(bot: any, point: Vec3, origin: Vec3) {
   return distance < .01 || !bot.world.raycast(origin, ray.scaled(1 / distance), Math.max(0, distance - .05));
 }
 
+/** A visible attachment face for both standing and crouching eye heights.
+ * Construction may inspect a proposed stance; sending still revalidates it. */
+export function placementFace(bot: any, cell: Vec3, feet = bot.entity.position): Vec3 | undefined {
+  const standing = feet.offset(0, bot.entity.eyeHeight || 1.62, 0);
+  const crouching = feet.offset(0, Math.min(bot.entity.eyeHeight || 1.62, 1.27), 0);
+  return [new Vec3(0,1,0),new Vec3(1,0,0),new Vec3(-1,0,0),new Vec3(0,0,1),new Vec3(0,0,-1),new Vec3(0,-1,0)].find(face => {
+    const reference=bot.blockAt(cell.minus(face));
+    if(reference?.boundingBox!=='block')return false;
+    const point=reference.position.offset(.5,.5,.5).plus(face.scaled(.5));
+    return [standing,crouching].every(eye=>point.distanceTo(eye)<=4.5&&clearLineFrom(bot,point,eye));
+  });
+}
+
 export function entityVisible(bot: any, entity: any) {
   const height = entity.height || 1;
   // An entity can remain visible above a ledge even when the closest corner is
@@ -494,6 +507,14 @@ export async function nativeWalkTo(bot: any, target: Vec3, signal: AbortSignal, 
     }
     await checked(signal, bot.lookAt(new Vec3(target.x, position.y + (bot.entity.eyeHeight || 1.62), target.z), true));
     bot.setControlState('jump', jump);
+    if (jump && grounded && target.y > position.y + .5) {
+      // Lift before pressing into a full-block riser. At a narrow stair edge,
+      // forward input during the first low jump ticks can be rejected by the
+      // server and repeatedly reset the landing state.
+      bot.setControlState('forward', false);
+      await delay(150, undefined, { signal });
+      continue;
+    }
     bot.setControlState('forward', true);
     await delay(50, undefined, { signal });
   } } finally { stopControls(); signal.removeEventListener('abort', stopControls); }
@@ -546,8 +567,9 @@ export async function runNativeAction(bot: any, proposal: any, signal: AbortSign
       const expectedItem = { name: item.name, type: item.type };
       requireOwnBodyClear(bot, cell, item.name);
       const faces = [new Vec3(0, 1, 0), new Vec3(1, 0, 0), new Vec3(-1, 0, 0), new Vec3(0, 0, 1), new Vec3(0, 0, -1), new Vec3(0, -1, 0)];
-      const face = faces.find(f => bot.blockAt(cell.minus(f))?.boundingBox === 'block');
-      if (!face) throw new Error('周围没有可依附的实体方块。');
+      const face = placementFace(bot,cell);
+      if (!face) throw new Error(faces.some(f=>bot.blockAt(cell.minus(f))?.boundingBox==='block')
+        ? '放置附着面被遮挡或超出眼位 4.5 格范围。' : '周围没有可依附的实体方块。');
       const reference = bot.blockAt(cell.minus(face));
       const referenceState = { name: reference.name, type: reference.type, stateId: reference.stateId };
       const facePoint = reference.position.offset(.5, .5, .5).plus(face.scaled(.5));
