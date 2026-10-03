@@ -447,8 +447,15 @@ export class MinecraftBody {
     const step = intent.goal.steps[index];
     // Reflexes above remain authorized even while ordinary work awaits a new
     // decision. Renewal alone does not erase failure or replay completed work.
-    if (this.replanRequired?.intentVersion === intent.version && this.replanRequired.stepIndex === index)
+    if (this.replanRequired?.intentVersion === intent.version && this.replanRequired.stepIndex === index) {
+      // Oxygen recovery stops selecting a new reaction, but blocked ordinary
+      // work must not repeatedly abort an already authorized floating slice.
+      // Its native loop still releases input in air and ends on dry ground;
+      // the controller retains cancellation, lease and skill deadlines.
+      if (current?.skill.reaction === 'surface' && allowed.includes('surface') && state.water && !state.lava)
+        return current.skill;
       return { kind: 'wait', reason: `replan_required:${this.replanRequired.code}` };
+    }
     if (step.type === 'bridge') {
       let progress = this.bridges.get(index);
       if (!progress) {

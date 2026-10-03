@@ -7,6 +7,7 @@ import { MinecraftBody } from '../adapters/minecraft/src/minecraft-body.ts';
 import { MinecraftWorld, type BotRecord } from '../adapters/minecraft/src/world.ts';
 import { runContinuousSkill } from '../adapters/minecraft/src/continuous-skills.ts';
 import { runNativeAction } from '../adapters/minecraft/src/native-actions.ts';
+import { trackBodyEnvironment } from '../adapters/minecraft/src/body-observation.ts';
 
 async function flush() { for (let index = 0; index < 16; index++) await Promise.resolve(); }
 function fixture(optimized: boolean) {
@@ -103,6 +104,83 @@ test('a confirmed eat reaction leaves a stale queued meal for one real failure a
   assert.deepEqual(f.body.snapshot().replanRequired, blocked.replanRequired);
   assert.equal(f.events.filter(event => event.type === 'goal-blocked').length, 1);
 });
+
+async function blockedWorkSurfaceFixture(t: any) {
+  const f = fixture(true); t.after(() => f.clean());
+  f.bot.entity.name = 'player';
+  f.bot.registry.entitiesByName = { player: { metadataKeys: ['air_supply'] } };
+  t.after(trackBodyEnvironment(f.bot));
+  const oxygen = (level: number) => f.bot._client.emit('entity_metadata', {
+    entityId: f.bot.entity.id, metadata: [{ key: 0, value: level * 15 }],
+  });
+  await f.submit([{ type: 'jump_to', x: 3, y: 64, z: 0 }], { reactions: ['surface'] });
+  await f.finish(0, { stoppedReason: 'landing_unavailable' });
+  assert.equal(f.body.snapshot().replanRequired?.code, 'landing_unavailable');
+  f.bot.entity.isInWater = true; f.bot.entity.onGround = false;
+  oxygen(16); await f.tick(50);
+  assert.equal(f.body.snapshot().current?.skill.reaction, 'surface');
+  return { ...f, oxygen };
+}
+
+test('recovering oxygen does not let blocked work cancel its authorized floating slice', async t => {
+  const f = await blockedWorkSurfaceFixture(t);
+  const blocked = f.body.snapshot().replanRequired;
+  const id = f.body.snapshot().current?.id;
+  for (const oxygen of [18, 20, 17, 20]) {
+    f.oxygen(oxygen); await f.tick(100);
+    assert.equal(f.calls[1].signal.aborted, false);
+    assert.equal(f.body.snapshot().current?.id, id);
+  }
+  await f.finish(1, { surfaceReached: true, dryGround: false, breathingConfirmed: false }, 'completed');
+  await f.tick(100);
+  assert.equal(f.calls.length, 2, 'Recovered oxygen does not authorize a new surface slice.');
+  assert.deepEqual(f.body.snapshot().replanRequired, blocked);
+  assert.deepEqual(f.body.snapshot().completedSteps, []);
+  assert.equal(f.body.snapshot().workCompleted, false);
+});
+
+test('retained floating slice still releases in air, resumes submerged input and drains on cancel', async t => {
+  const f = await blockedWorkSurfaceFixture(t);
+  let eyesAir = false;
+  f.bot.blockAt = (p: Vec3) => ({ name: eyesAir && p.y >= 65 ? 'air' : 'water', boundingBox: 'empty', position: p });
+  const native = runContinuousSkill(f.bot, f.calls[1].action, f.calls[1].signal);
+  const drained = assert.rejects(native);
+  assert.equal(f.bot.getControlState('jump'), true);
+  eyesAir = true; f.oxygen(20); await f.tick(100);
+  assert.equal(f.calls[1].signal.aborted, false);
+  await new Promise(resolve => setTimeout(resolve, 80));
+  assert.equal(f.bot.getControlState('jump'), false, 'Air geometry releases upward input without losing the owner.');
+  eyesAir = false; f.oxygen(16);
+  await new Promise(resolve => setTimeout(resolve, 80));
+  assert.equal(f.bot.getControlState('jump'), true, 'Submersion resumes real input without a model call or new skill.');
+  assert.equal(f.body.cancel(f.body.snapshot().version).accepted, true);
+  await drained; await f.finish(1, {}, 'cancelled');
+  assert.equal(f.bot.getControlState('jump'), false);
+  assert.equal(f.bot.jumpQueued, false);
+});
+
+for (const transition of ['cancel', 'stop', 'replace', 'expiry', 'deadline', 'lava', 'dry', 'death']) {
+  test(`retained surface authorization yields to ${transition}`, async t => {
+    const f = await blockedWorkSurfaceFixture(t);
+    f.oxygen(20); await f.tick(50);
+    assert.equal(f.calls[1].signal.aborted, false);
+    let stopping: Promise<void> | undefined;
+    if (transition === 'cancel') f.body.cancel(f.body.snapshot().version);
+    else if (transition === 'stop') stopping = f.body.stop('test stop');
+    else if (transition === 'replace') await f.submit([{ type: 'wait', ms: 100 }]);
+    else if (transition === 'expiry') await f.tick(120000);
+    else if (transition === 'deadline') await f.tick(19000);
+    else {
+      if (transition === 'lava') f.bot.entity.isInLava = true;
+      if (transition === 'dry') { f.bot.entity.isInWater = false; f.bot.entity.onGround = true; }
+      if (transition === 'death') f.bot.health = 0;
+      await f.tick(50);
+    }
+    assert.equal(f.calls[1].signal.aborted, true);
+    assert.equal(f.calls.length, 2, 'No new owner may start before the retained slice drains.');
+    await f.finish(1, {}, 'cancelled'); await stopping;
+  });
+}
 
 test('an actually occluded dig target requests fresh planning once without disclosing or completing the target', async t => {
   const f = fixture(true); t.after(() => f.clean());
