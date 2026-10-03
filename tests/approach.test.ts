@@ -292,16 +292,61 @@ test('travel can round an occluding loaded wall with legal native movement witho
   assert.doesNotMatch(JSON.stringify(result), /diamond_ore|waypoints|blocker/); assert.deepEqual(bot.controls, {});
 });
 
-test('travel refuses unknown crossings and unsupported cliffs rather than treating either as air or bridges', async () => {
+test('travel takes its safe reachable prefix once and stops before unknown crossings or unsupported cliffs', async () => {
   for (const kind of ['unknown', 'cliff']) {
     const { bot, steps } = fixture(p => kind === 'unknown' && p.x >= 3 ? null
       : p.x <= 2 && Math.abs(p.z) <= 2 && p.y < 64 ? 'stone' : 'air');
     await assert.rejects(travelToArea(bot, { type: 'travel', x: 12.5, z: .5 }, new AbortController().signal, controls), (error: any) => {
       assert.equal(error.details.travel.reached, false); assert.equal(error.details.travel.stoppedReason, 'no_path');
-      assert.deepEqual(error.details.travel.target, { x: 12.5, z: .5 }); assert.equal(error.details.travel.target.y, undefined); return true;
+      assert.deepEqual(error.details.travel.target, { x: 12.5, z: .5 }); assert.equal(error.details.travel.target.y, undefined);
+      assert.equal(error.details.travel.partial, true); assert.equal(error.details.travel.planning.plans, 1);
+      assert.equal(error.details.travel.planning.legs, 2); assert.ok(error.details.travel.distance < 12);
+      assert.deepEqual(error.details.travel.position, { ...bot.entity.position });
+      assert.doesNotMatch(JSON.stringify(error.details), /waypoints|openHeap|visitedChunks/); return true;
     });
-    assert.deepEqual(steps, []); assert.deepEqual(bot.controls, {});
+    assert.ok(steps.length > 0); assert.ok(bot.entity.position.x > 2);
+    assert.ok(steps.every(p => p.x <= 2.61 && p.y === 64)); assert.deepEqual(bot.controls, {});
   }
+});
+
+test('travel recovery requires meaningful progress from the actual offset body, not the planner cell centre', async () => {
+  const { bot, steps } = fixture(p => p.x >= 0 && p.x <= 1 && p.z === 0 && p.y < 64 ? 'stone' : 'air');
+  bot.entity.position = new Vec3(.95, 64, .9);
+  const target = { type: 'travel' as const, x: 12.5, z: 4.5 };
+  const before = bot.entity.position.clone(), endpoint = new Vec3(1.5, 64, .5);
+  const distance = (p: Vec3) => Math.hypot(target.x - p.x, target.z - p.z);
+  assert.ok(distance(before.floored().offset(.5, 0, .5)) - distance(endpoint) > .5);
+  assert.ok(distance(before) - distance(endpoint) < .5);
+  await assert.rejects(travelToArea(bot, target, new AbortController().signal, controls), (error: any) => {
+    assert.equal(error.details.travel.stoppedReason, 'no_path'); assert.equal(error.details.travel.reached, false);
+    assert.equal(error.details.travel.planning.legs, 0); assert.equal(error.details.travel.partial, false); return true;
+  });
+  assert.deepEqual(steps, []); assert.ok(bot.entity.position.equals(before)); assert.deepEqual(bot.controls, {});
+});
+
+test('travel recovery stops before a loaded landing hidden below the current ledge', async () => {
+  const { bot, steps } = fixture(p => p.z === 0 && p.x >= 0 && p.x <= 1 && p.y < (p.x === 0 ? 64 : 61) ? 'stone' : 'air');
+  await assert.rejects(travelToArea(bot, { type: 'travel', x: 5.5, z: .5 }, new AbortController().signal, controls), (error: any) => {
+    assert.equal(error.details.travel.stoppedReason, 'no_path'); assert.equal(error.details.travel.reached, false);
+    assert.ok(error.details.travel.planning.nodes > 1, 'The planner can reach the lower loaded landing.');
+    assert.equal(error.details.travel.planning.plans, 1); assert.equal(error.details.travel.planning.legs, 0);
+    assert.equal(error.details.travel.partial, false); return true;
+  });
+  assert.deepEqual(steps, []); assert.deepEqual(bot.controls, {});
+});
+
+test('travel recovery rechecks support and stops its one prefix when the next landing changes', async () => {
+  let removed = false;
+  const { bot, steps } = fixture(p => p.z === 0 && p.x >= 0 && p.x <= 3 && p.y < 64
+    && !(removed && p.x >= 2) ? 'stone' : 'air');
+  await assert.rejects(travelToArea(bot, { type: 'travel', x: 12.5, z: .5 }, new AbortController().signal, {
+    ...controls, moveTo: async (...args: Parameters<typeof nativeWalkTo>) => { await nativeWalkTo(...args); removed = true; },
+  }), (error: any) => {
+    assert.equal(error.details.travel.stoppedReason, 'no_path'); assert.equal(error.details.travel.reached, false);
+    assert.equal(error.details.travel.partial, true); assert.equal(error.details.travel.planning.plans, 1);
+    assert.equal(error.details.travel.planning.legs, 1); return true;
+  });
+  assert.ok(steps.length > 0); assert.ok(steps.every(p => p.x <= 1.61)); assert.deepEqual(bot.controls, {});
 });
 
 test('real planner and native body allow a three-block descent while refusing four blocks', async () => {
@@ -410,8 +455,9 @@ test('travel rejects distant XZ before reading collision geometry', async () => 
   assert.deepEqual(reads, []);
 });
 
-test('travel cancellation clears input immediately but awaits the active native leg and preserves partial progress', async () => {
-  const { bot } = fixture(openFloor), controller = new AbortController();
+for (const route of ['complete', 'partial']) test(`travel cancellation drains the active native ${route} route leg and preserves partial progress`, async () => {
+  const { bot } = fixture(route === 'complete' ? openFloor : p => p.z === 0 && p.x >= 0 && p.x <= 2 && p.y < 64 ? 'stone' : 'air');
+  const controller = new AbortController();
   let begin!: () => void, finish!: () => void, settled = false, calls = 0;
   const started = new Promise<void>(resolve => { begin = resolve; }), drain = new Promise<void>(resolve => { finish = resolve; });
   const pending = travelToArea(bot, { type: 'travel', x: 13.5, z: .5 }, controller.signal, {

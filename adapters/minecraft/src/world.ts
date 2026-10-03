@@ -10,6 +10,8 @@ import { blockProperties } from './block-observation.ts';
 import { inventorySessionUsable } from './craft-sync.ts';
 import { bodyEnvironment, trackBodyEnvironment } from './body-observation.ts';
 import { IdleWaterPosture } from './idle-water-posture.ts';
+import { MinecraftBody, NON_BODY_ACTIONS, validateBodyAction, bodyActionTimeoutMs } from './minecraft-body.ts';
+import { runContinuousSkill } from './continuous-skills.ts';
 import { NPC_COMMUNICATION, parseChatChannel } from './communication.ts';
 export { NPC_COMMUNICATION } from './communication.ts';
 
@@ -17,19 +19,34 @@ export type BotRecord = {
   name: string; persona: string; roleId?: string; bot: any; ready: boolean; inventorySynced?: boolean;
   events: any[]; error?: string; actionController?: AbortController;
   waterPosture?: IdleWaterPosture;
+  body?: MinecraftBody;
+  operatorStopped?: boolean;
   task?: { id: string; controller: AbortController }; viewer?: { url: string; close: () => void };
 };
+
+export type BodyExecutionMode = 'serial' | 'parallel' | 'dual';
+// A host admission ticket is captured before asynchronous request parsing. It
+// cannot turn an older request into a resume after a newer stop or plan.
+export type BodyActivationTicket = { record: BotRecord; epoch: number; version?: number };
+type HostAuthorization = { epoch: number; session?: number; mode: BodyExecutionMode; faulted: boolean;
+  respawn?: { ticket: BodyActivationTicket; session: number; drained: Promise<void> } };
 
 export class MinecraftWorld {
   bots = new Map<string, BotRecord>();
   private listeners = new Map<string, Set<(event: any) => void>>();
+  private hostAuthorization = new WeakMap<BotRecord, HostAuthorization>();
+  private autonomousSession = 0;
+  private autonomousActive = false;
   host: string; port: number; version: string; logDirectory: string;
   memoryNamespace = 'minecraft';
+  dualLoop: boolean;
+  onControlMetric?: (record: BotRecord, event: any) => void;
   onSpawn?: (record: BotRecord) => void;
   onEvent?: (record: BotRecord, event: any) => void;
-  constructor(options: { host: string; port: number; version: string; logDirectory: string }) {
+  constructor(options: { host: string; port: number; version: string; logDirectory: string; dualLoop?: boolean }) {
     Object.assign(this, options);
     this.host = options.host; this.port = options.port; this.version = options.version; this.logDirectory = options.logDirectory;
+    this.dualLoop = options.dualLoop === true;
   }
 
   add(name: string, persona: string, roleId?: string) {
@@ -40,17 +57,14 @@ export class MinecraftWorld {
     trackBodyEnvironment(bot);
     const record: BotRecord = { name, persona, roleId, bot, ready: false, inventorySynced: false, events: [], waterPosture: new IdleWaterPosture(bot) };
     this.bots.set(name, record);
+    if (this.dualLoop) record.body = new MinecraftBody(this, record, event => this.onControlMetric?.(record, event));
     bot._client?.on('window_items', (packet: any) => {
       if (packet.windowId !== 0) return;
       // Run after Mineflayer has applied the whole player-inventory packet.
       // An allocated empty slots array alone is not proof of an empty inventory.
       queueMicrotask(() => { record.inventorySynced = true; });
     });
-    bot.on('spawn', () => {
-      record.ready = true;
-      this.event(record, 'spawn', { position: { ...bot.entity.position }, dimension: bot.game.dimension });
-      this.onSpawn?.(record);
-    });
+    bot.on('spawn', () => this.spawned(record));
     let lastHealth: number | undefined;
     bot.on('health', () => {
       const health = Number(bot.health);
@@ -88,6 +102,13 @@ export class MinecraftWorld {
   }
 
   event(record: BotRecord, type: string, data: any) {
+    if (type === 'control-error' && String(data?.controlEvent?.reason).startsWith('Body halt failed:')) {
+      const authorization = this.authorization(record);
+      authorization.faulted = true;
+      this.revokeHostAuthorization(record);
+      record.operatorStopped = true;
+      record.task?.controller.abort();
+    }
     const event = { id: randomUUID(), npcId: record.name, time: new Date().toISOString(), type, ...data };
     record.events.push(event);
     if (record.events.length > 100) record.events.shift();
@@ -97,6 +118,114 @@ export class MinecraftWorld {
       try { listener(event); } catch (error: any) { record.error = `感知订阅失败：${error.message}`; }
     }
     return event;
+  }
+
+  private authorization(record: BotRecord): HostAuthorization {
+    let authorization = this.hostAuthorization.get(record);
+    if (!authorization) {
+      authorization = { epoch: 0, mode: 'dual', faulted: false };
+      this.hostAuthorization.set(record, authorization);
+    }
+    return authorization;
+  }
+
+  captureActivation(record: BotRecord): BodyActivationTicket {
+    return { record, epoch: this.authorization(record).epoch, version: record.body?.snapshot().version };
+  }
+
+  private activationCurrent(ticket: BodyActivationTicket) {
+    return this.bots.get(ticket.record.name) === ticket.record
+      && this.authorization(ticket.record).epoch === ticket.epoch
+      && ticket.record.body?.snapshot().version === ticket.version;
+  }
+
+  private revokeHostAuthorization(record: BotRecord) {
+    const authorization = this.authorization(record);
+    authorization.epoch++; authorization.session = undefined; authorization.respawn = undefined;
+  }
+
+  private checkAdmission(ticket: BodyActivationTicket, mode: BodyExecutionMode) {
+    const record = ticket.record, control = record.body?.snapshot();
+    if (!this.activationCurrent(ticket)) throw new ApiError(409, '恢复请求已失效，请重新发起任务。');
+    if (!record.ready || !(record.bot.health > 0)) throw new ApiError(503, '角色尚未进入世界。');
+    if (record.task) throw new ApiError(409, '角色正在执行其他任务。');
+    if (this.authorization(record).faulted) throw new ApiError(409, '身体停止失败，需要检查执行器后显式恢复控制。');
+    if (control?.current?.phase === 'draining' || control?.current && (control.stopped || !control.intent)
+      || record.actionController && !control?.current) throw new ApiError(409, '身体上一动作仍在收尾。');
+    if (mode !== 'dual' && control?.intent?.allowedReactions.length)
+      throw new ApiError(409, '无反应对照不能继承已有自保授权，请先停止当前计划。');
+  }
+
+  private grantSurvival(ticket: BodyActivationTicket, mode: BodyExecutionMode) {
+    const record = ticket.record, authorization = this.authorization(record);
+    if (!this.activationCurrent(ticket) || authorization.faulted || !record.ready || !(record.bot.health > 0)) return false;
+    const control = record.body?.snapshot();
+    // An explicit new host session does not replace work that is still valid.
+    if (control && !(control.intent && !control.stopped && control.intent.expiresAt > Date.now())) {
+      if (control.current || record.actionController) return false;
+      const result = record.body!.submit({ expectedVersion: ticket.version, steps: [], ttlMs: 120000,
+        label: '宿主授权：等待规划时保持生存', reactions: mode === 'dual' ? ['surface', 'eat', 'defend', 'flee'] : [] }, control.stopped);
+      if (!result.accepted) return false; // A failed CAS is never retried using a newer version.
+    }
+    if (authorization.epoch !== ticket.epoch || authorization.faulted) return false;
+    record.operatorStopped = false;
+    return true;
+  }
+
+  /** Explicit host task admission only; ordinary reasoning turns never call it. */
+  authorizeTask(ticket: BodyActivationTicket, mode: BodyExecutionMode = 'dual') {
+    this.checkAdmission(ticket, mode);
+    if (!this.grantSurvival(ticket, mode)) throw new ApiError(409, '身体授权已变化，本次恢复未执行。');
+    this.authorization(ticket.record).mode = mode;
+  }
+
+  /** startHost must be synchronous: scheduler admission happens before unlocking
+   * actors, and its deferred model work starts after these one-shot grants. */
+  startAutonomy(startHost: () => void, mode: BodyExecutionMode = 'dual') {
+    if (this.autonomousActive) { startHost(); return; }
+    const tickets = [...this.bots.values()].map(record => this.captureActivation(record));
+    for (const ticket of tickets) this.checkAdmission(ticket, mode);
+    startHost(); // Rejected scheduler/drain admission must leave every stop latch intact.
+    const session = ++this.autonomousSession;
+    this.autonomousActive = true;
+    for (const ticket of tickets) {
+      const authorization = this.authorization(ticket.record);
+      if (!this.grantSurvival(ticket, mode)) {
+        this.endAutonomy();
+        throw new ApiError(409, '身体授权已变化，自主恢复未完成。');
+      }
+      authorization.session = session; authorization.mode = mode;
+    }
+  }
+
+  /** Revoke respawn authority synchronously, before scheduler shutdown awaits. */
+  endAutonomy() {
+    this.autonomousActive = false; this.autonomousSession++;
+    for (const record of this.bots.values()) this.revokeHostAuthorization(record);
+  }
+
+  /** Shared by the real Mineflayer spawn event and local wiring tests. A spawn
+   * alone is never authorization; only the preceding live-session ticket is. */
+  spawned(record: BotRecord) {
+    record.ready = true;
+    this.event(record, 'spawn', { position: { ...record.bot.entity.position }, dimension: record.bot.game.dimension });
+    this.onSpawn?.(record);
+    const authorization = this.authorization(record), pending = authorization.respawn;
+    authorization.respawn = undefined;
+    if (!pending) return;
+    void pending.drained.then(() => {
+      if (!this.autonomousActive || authorization.session !== this.autonomousSession || pending.session !== this.autonomousSession
+        || record.operatorStopped || authorization.faulted) return;
+      this.grantSurvival(pending.ticket, authorization.mode);
+    }).catch(() => { /* Failed physical drain never grants new control. */ });
+  }
+
+  acknowledgeExplicitResume(record: BotRecord) {
+    // Only used after a caller's explicit, versioned body resume was accepted.
+    if (record.body?.snapshot().stopped) return;
+    this.revokeHostAuthorization(record);
+    this.authorization(record).faulted = false;
+    record.operatorStopped = false;
   }
 
   subscribe(name: string, listener: (event: any) => void) {
@@ -131,6 +260,7 @@ export class MinecraftWorld {
     return { name: record.name, ready: record.ready, inventorySynced: record.inventorySynced, persona: record.persona, roleId: record.roleId,
       position: record.ready ? record.bot.entity.position : null, health: record.bot.health, food: record.bot.food, dimension: record.bot.game?.dimension,
       inventoryConfirmed,
+      ...(record.body ? { control: record.body.snapshot(), brainBusy: Boolean(record.task), bodyBusy: Boolean(record.actionController) } : {}),
       inventory: inventoryConfirmed ? record.bot.inventory?.items().map((item: any) => ({ name: item.name, count: item.count })) || [] : undefined,
       busy: Boolean(record.actionController || record.task), taskId: record.task?.id,
       viewer: record.viewer?.url, error: record.error };
@@ -174,6 +304,7 @@ export class MinecraftWorld {
       && typeof bot.time?.isDay === 'boolean' && Number.isFinite(bot.time?.timeOfDay)
       ? (bot.time.isDay ? 'day' : 'night') : undefined;
     return { name, npcId: name, time: new Date().toISOString(), position, dimension: bot.game.dimension, health: bot.health, food: bot.food,
+      ...(record.body ? { control: record.body.snapshot() } : {}),
       ...bodyEnvironment(bot),
       ...(record.waterPosture ? { posture: record.waterPosture.snapshot() } : {}),
       gameMode: bot.game.gameMode, timeOfDay: bot.time?.timeOfDay, ...(dayPhase ? { dayPhase } : {}),
@@ -189,15 +320,48 @@ export class MinecraftWorld {
   stop(record: BotRecord, worldEvent?: 'death' | 'respawn' | 'disconnected') {
     const reason = worldEvent ? { type: 'world-event', event: worldEvent } : undefined;
     record.waterPosture?.disable();
+    const authorization = this.authorization(record);
+    authorization.epoch++; authorization.respawn = undefined;
+    if (!worldEvent || worldEvent === 'disconnected') {
+      authorization.session = undefined;
+      if (!worldEvent) record.operatorStopped = true;
+    }
+    const drained = record.body?.stop(worldEvent || 'operator-stop');
     record.actionController?.abort(reason); record.task?.controller.abort(reason);
     haltNative(record.bot);
+    if ((worldEvent === 'death' || worldEvent === 'respawn') && this.autonomousActive
+      && authorization.session === this.autonomousSession && !record.operatorStopped && !authorization.faulted) {
+      authorization.respawn = { ticket: this.captureActivation(record), session: this.autonomousSession,
+        drained: drained ?? Promise.resolve() };
+    }
+    return drained ?? Promise.resolve();
   }
 
   async execute(name: string, raw: any, taskId?: string) {
-    const proposal = action(raw);
+    const record = this.get(name);
+    if (record.body && NON_BODY_ACTIONS.has(raw?.type)) {
+      if (!record.ready) throw new ApiError(503, '角色尚未进入世界。');
+      const proposal = action(raw), started = Date.now();
+      const details = await runNativeAction(record.bot, proposal, new AbortController().signal,
+        (type, data) => this.event(record, type, data));
+      const receipt = { id: randomUUID(), status: 'completed', action: proposal, details, durationMs: Date.now() - started };
+      this.event(record, 'action', receipt); return receipt;
+    }
+    if (record.body && raw?.type !== 'stop') throw new ApiError(409, '双循环模式请通过body_plan提交身体目标；查询与说话仍可使用action。');
+    return this.perform(name, raw, taskId);
+  }
+
+  /** Only the single-owner controller invokes this; model turn cancellation is not its signal. */
+  async executeOwned(name: string, raw: any, signal: AbortSignal) {
+    return this.perform(name, raw, undefined, signal);
+  }
+
+  private async perform(name: string, raw: any, taskId?: string, bodySignal?: AbortSignal) {
+    const proposal = bodySignal ? validateBodyAction(raw) : action(raw);
     const record = this.get(name), bot = record.bot;
     if (proposal.type === 'stop') {
       record.waterPosture?.disable();
+      if (record.body && taskId) throw new ApiError(409, '身体停止需要cancel_body和已观察的expectedVersion。');
       if (taskId && record.task?.id === taskId) {
         // A character choosing to stop walking is still allowed to finish its
         // reasoning turn. Only the operator's stop cancels the entire task.
@@ -205,16 +369,17 @@ export class MinecraftWorld {
         const result = { id: randomUUID(), status: 'completed', action: proposal, details: { movementStopped: true } };
         this.event(record, 'action', result); return result;
       }
-      this.stop(record); return { status: 'completed', type: 'stop' };
+      await this.stop(record); return { status: 'completed', type: 'stop' };
     }
     if (!record.ready) throw new ApiError(503, '角色尚未进入世界。');
-    if (record.actionController || (record.task && record.task.id !== taskId)) throw new ApiError(409, '角色正在执行行动或 LLM 任务。');
+    if (record.actionController || (!bodySignal && record.task && record.task.id !== taskId)) throw new ApiError(409, '角色正在执行行动或 LLM 任务。');
     const controller = new AbortController();
     record.actionController = controller;
     record.waterPosture?.suspend();
-    const abort = () => controller.abort(record.task?.controller.signal.reason);
-    record.task?.controller.signal.addEventListener('abort', abort, { once: true });
-    if (record.task?.controller.signal.aborted) abort();
+    const ownerSignal = bodySignal ?? record.task?.controller.signal;
+    const abort = () => controller.abort(ownerSignal?.reason);
+    ownerSignal?.addEventListener('abort', abort, { once: true });
+    if (ownerSignal?.aborted) abort();
     const inventoryCounts = () => {
       const totals = new Map<string, number>();
       for (const item of bot.inventory.items()) totals.set(item.name, (totals.get(item.name) || 0) + item.count);
@@ -239,18 +404,20 @@ export class MinecraftWorld {
     };
     const cancel = () => haltNative(bot);
     controller.signal.addEventListener('abort', cancel, { once: true });
-    const actionTimeout = proposal.type === 'fish' ? proposal.durationMs + 8000
+    const actionTimeout = bodySignal ? bodyActionTimeoutMs(proposal) : proposal.type === 'fish' ? proposal.durationMs + 8000
       : ['gather', 'craft', 'smelt', 'container'].includes(proposal.type) ? 45000 : 15000;
     const timer = setTimeout(() => controller.abort(), actionTimeout);
+    let details: any;
     try {
       checkSignal(controller.signal);
-      let details: any;
       if (proposal.type === 'posture') {
         record.waterPosture ??= new IdleWaterPosture(bot);
         record.waterPosture.suspend();
         const posture = proposal.mode === 'none' ? record.waterPosture.disable() : record.waterPosture.enable(proposal.durationMs);
         details = { posture, note: '姿态授权已更新，当前动作释放身体后才可生效；active只表示正在按跳跃，不证明已换气或到达水面。' };
-      } else details = await runNativeAction(bot, proposal, controller.signal, (type, data) => this.event(record, type, data));
+      } else details = bodySignal
+        ? await runContinuousSkill(bot, proposal, controller.signal, (type, data) => this.event(record, type, data))
+        : await runNativeAction(bot, proposal, controller.signal, (type, data) => this.event(record, type, data));
       if (proposal.type === 'say' || proposal.type === 'broadcast') details = { ...details, communication: { ...NPC_COMMUNICATION },
         channel: proposal.type === 'broadcast' ? 'broadcast' : 'local', deliveryConfirmed: false,
         note: proposal.type === 'broadcast' ? '已通过服务器聊天发出世界广播；发出不证明任何同伴收到或同意，须由实际回应确认。'
@@ -260,7 +427,7 @@ export class MinecraftWorld {
       this.event(record, 'action', result);
       return result;
     } catch (error: any) {
-      const result = { id, status: controller.signal.aborted ? 'cancelled' : 'failed', action: proposal, before, after: { ...bot.entity.position }, error: error.message, details: withVitals(error.details), durationMs: Date.now() - started };
+      const result = { id, status: controller.signal.aborted ? 'cancelled' : 'failed', action: proposal, before, after: { ...bot.entity.position }, error: error.message, details: withVitals(error.details ?? details), durationMs: Date.now() - started };
       this.event(record, 'action', result);
       if (error instanceof ApiError) throw error;
       return result;
@@ -269,11 +436,11 @@ export class MinecraftWorld {
       // finish later and interfere with the next task after Promise.race returns.
       haltNative(bot);
       clearTimeout(timer); controller.signal.removeEventListener('abort', cancel);
-      record.task?.controller.signal.removeEventListener('abort', abort);
+      ownerSignal?.removeEventListener('abort', abort);
       record.actionController = undefined;
-      record.waterPosture?.resume();
+      if (!record.body) record.waterPosture?.resume();
     }
   }
 
-  close() { for (const record of this.bots.values()) { this.stop(record); record.waterPosture?.dispose(); record.viewer?.close(); record.bot.quit(); } this.listeners.clear(); }
+  close() { this.endAutonomy(); for (const record of this.bots.values()) { this.stop(record); void record.body?.dispose(); record.waterPosture?.dispose(); record.viewer?.close(); record.bot.quit(); } this.listeners.clear(); }
 }

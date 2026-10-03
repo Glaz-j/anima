@@ -61,12 +61,16 @@ API 只监听本机，默认端口 18791。启动时随机生成 Bearer token，
 | `GET /api/bots` | 所有角色的公开状态 |
 | `POST /api/bots` | 创建角色：`name`、`persona`、可选 `roleId`，最多 4 个 |
 | `GET /api/bots/:name/observe` | 本角色的位置、背包、可见实体、附近方块和近期经历 |
-| `POST /api/bots/:name/actions` | 直接执行一个游戏行动 |
+| `POST /api/bots/:name/actions` | 双循环下用于 scan/recipes/say/broadcast；身体动作通过 intent 提交 |
+| `GET /api/bots/:name/control` | 身体授权版本、当前目标、技能、进度和实际回执 |
+| `POST /api/bots/:name/intent` | 提交 expectedVersion、steps、ttlMs、reactions；202 只表示接收 |
 | `POST /api/bots/:name/tasks` | 输入 `instruction`，调用实际模型执行目标 |
-| `POST /api/bots/:name/stop` | 中断当前任务与行动 |
+| `POST /api/bots/:name/stop` | 锁存停止，撤销目标，等待真实执行器收尾 |
 | `POST /api/shutdown` | 保存并关闭本地实验室 |
 
 除 health/session 外，接口需要 `Authorization: Bearer TOKEN`。POST 行动与任务需 `Content-Type: application/json`。
+
+服务默认使用独立双循环（`ANIMA_MC_DUAL_LOOP=false` 可用于旧串行接口诊断）。模型思考与身体技能拥有独立生命周期；授权有期限，版本不匹配的旧计划会被拒绝。提交 intent 前先读取本角色 control.version；steps 最多12步，reactions 显式选择 surface/eat/defend/flee，ttlMs 为1000–300000。相同计划默认只续租、保留进度，明确重做才用 restart=true；人工停止后须用新观察版本并显式 resume=true 恢复。接收回执不是完成证明，要查看匹配版本的技能结果和实际世界状态。详见 [身体控制契约](../../docs/body-controller-contract.md) 与 [技能考场](../../docs/minecraft-skill-exam.md)。
 
 PowerShell 示例不把 token 打印到终端：
 
@@ -79,7 +83,7 @@ Invoke-RestMethod ($mcSession.baseUrl + '/api/bots/Sheldon/tasks') -Method Post 
   -Body ([System.Text.Encoding]::UTF8.GetBytes('{"instruction":"观察附近，然后向福尔摩斯打个招呼。"}'))
 ```
 
-行动示例：
+行动示例（双循环下身体动作放入 `intent.steps`；查询与交谈仍通过 actions）：
 
 ```json
 {"type":"goto","x":3,"y":-60,"z":0}

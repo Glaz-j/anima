@@ -33,7 +33,8 @@ const runtime = JSON.parse(await readFile(join(runtimeDirectory, 'runtime.json')
 const host = process.env.ANIMA_MC_HOST || '127.0.0.1';
 if (!['127.0.0.1', 'localhost'].includes(host)) throw new Error('第一版只支持本机 Minecraft 服务器。');
 const gamePort = Number(process.env.ANIMA_MC_PORT || 25565);
-const world = new MinecraftWorld({ host, port: gamePort, version: process.env.ANIMA_MC_VERSION || runtime.version, logDirectory: join(runtimeDirectory, 'events') });
+const world = new MinecraftWorld({ host, port: gamePort, version: process.env.ANIMA_MC_VERSION || runtime.version, logDirectory: join(runtimeDirectory, 'events'),
+  dualLoop: process.env.ANIMA_MC_DUAL_LOOP !== 'false' });
 const playClient = new PlayClient({ root, host, port: gamePort, version: world.version, mode: 'native' });
 let viewer: Awaited<ReturnType<typeof startViewerService>> | undefined;
 let viewerError = '';
@@ -49,14 +50,15 @@ const survival = survivalEnabled ? new SurvivalScenario(join(runtimeDirectory, '
 const scenario = survival || dragon;
 const objective = survival ? '四人从随机主世界空手开始，通力协作准备生存资源，探索前往末地，最终击败末影龙。击败末影龙可以帮助大家逃出这个世界。根据当前处境自主安排工作、沟通和调整计划。' : '四人共同协作，击败末影龙可以帮助大家逃出这个世界。';
 const scheduler = scenario ? new NpcScheduler({
-  getActors: () => [...world.bots.values()].map(r => ({ name: r.name, ready: r.ready, busy: Boolean(r.task || r.actionController) })),
+  getActors: () => [...world.bots.values()].map(r => ({ name: r.name, ready: r.ready && !r.operatorStopped, busy: Boolean(r.task || (!r.body && r.actionController)) })),
   run: (name, instruction, signal) => runTask(world, name, instruction, root, { signal, worldId: world.memoryNamespace }),
   cancel: name => world.stop(world.get(name)),
+  cancelTurn: name => { const record = world.get(name); record.task?.controller.abort(); if (!record.body) record.actionController?.abort(); },
   scenarioStatus: () => ({ complete: scenario.status().complete, summary: objective }),
   objective,
   intervalMs: 10000, taskTimeoutMs: 100000,
   onError: (error, name) => console.error(`NPC ${name || 'scheduler'}: ${String(error)}`),
-  onComplete: () => console.log(`${scenarioName}: authoritative victory verified.`),
+  onComplete: () => { world.endAutonomy(); console.log(`${scenarioName}: authoritative victory verified.`); },
 }) : undefined;
 const provisioned = new Set<string>(), respawning = new Set<string>();
 (world as any).scenarioContext = () => scenario?.publicContext();
@@ -131,13 +133,14 @@ const server = createServer(async (request, response) => {
         return send(result.available ? 200 : 503, { ...result, connected: playerConnected(), ...(result.available ? {} : { error: result.message }) });
       }
       if (request.method === 'GET' && url.pathname === '/api/experiment') return send(200, { scenario: scenario?.status(), scheduler: scheduler?.status() });
-      if (request.method === 'POST' && url.pathname === '/api/experiment/stop') { await scheduler?.stop(); await scenario?.stop(); return send(200, { stopped: true }); }
+      if (request.method === 'POST' && url.pathname === '/api/experiment/stop') { world.endAutonomy(); await scheduler?.stop(); await scenario?.stop(); return send(200, { stopped: true }); }
       if (request.method === 'POST' && url.pathname === '/api/experiment/start') {
         if (!scenario || !scheduler) throw new ApiError(409, '请通过 minecraft:survival 启动完整生存实验。');
         if (!initialized) throw new ApiError(409, '世界和初始背包还在同步，请稍后再开始。');
         if (world.bots.size !== 4 || [...world.bots.values()].some(r => !r.ready) || (dragon && provisioned.size !== 4)) throw new ApiError(409, '四位角色尚未准备好。');
         if (survival) captureInitialSurvivalState(world, survival);
-        scenario.start(); scheduler.start(); return send(200, { started: true });
+        world.startAutonomy(() => { scenario.start(); scheduler.start(); });
+        return send(200, { started: true });
       }
       if (request.method === 'GET' && url.pathname === '/api/bots') return send(200, { bots: [...world.bots.values()].map(botSummary) });
       if (request.method === 'POST' && url.pathname === '/api/bots') {
@@ -148,17 +151,26 @@ const server = createServer(async (request, response) => {
         if (roleId && !/^[a-z0-9_-]+$/u.test(roleId)) throw new ApiError(400, '无效角色档案 ID。');
         return send(201, botSummary(world.add(name, persona, roleId)));
       }
-      const match = /^\/api\/bots\/([A-Za-z0-9_]+)\/(observe|actions|tasks|stop)$/u.exec(url.pathname);
+      const match = /^\/api\/bots\/([A-Za-z0-9_]+)\/(observe|actions|tasks|stop|control|intent)$/u.exec(url.pathname);
       if (match) {
         const [, name, endpoint] = match;
         if (request.method === 'GET' && endpoint === 'observe') return send(200, world.observe(name));
+        if (request.method === 'GET' && endpoint === 'control') return send(200, world.get(name).body?.snapshot() || { enabled: false });
+        if (request.method === 'POST' && endpoint === 'intent') {
+          const record = world.get(name), input = await body(request);
+          if (!record.body) throw new ApiError(409, '双循环未启用。');
+          const result = record.body.submit(input, input.resume === true);
+          if (result.accepted && input.resume === true) world.acknowledgeExplicitResume(record);
+          return send(result.accepted ? 202 : 409, result);
+        }
         if (request.method === 'POST' && ['actions', 'tasks'].includes(endpoint) && !initialized) throw new ApiError(409, '世界尚未完成初始化。');
         if (request.method === 'POST' && endpoint === 'actions') return send(200, await world.execute(name, await body(request)));
         if (request.method === 'POST' && endpoint === 'tasks') {
+          const newTask = world.captureActivation(world.get(name));
           const input = await body(request);
-          return send(200, await runTask(world, name, text(input.instruction, 'instruction', 3000), root, { worldId: world.memoryNamespace }));
+          return send(200, await runTask(world, name, text(input.instruction, 'instruction', 3000), root, { worldId: world.memoryNamespace, newTask }));
         }
-        if (request.method === 'POST' && endpoint === 'stop') { world.stop(world.get(name)); return send(200, { stopped: true }); }
+        if (request.method === 'POST' && endpoint === 'stop') { await world.stop(world.get(name)); return send(200, { stopped: true }); }
       }
       if (request.method === 'POST' && url.pathname === '/api/shutdown') { send(200, { stopping: true }); void shutdown(); return; }
       throw new ApiError(404, '接口不存在。');
@@ -178,7 +190,7 @@ async function shutdown() {
   if (closing) return;
   closing = true; if (monitor) clearInterval(monitor);
   initialized = false;
-  await scheduler?.stop(); await scenario?.stop(); await viewer?.close(); world.close(); server.close();
+  world.endAutonomy(); await scheduler?.stop(); await scenario?.stop(); await viewer?.close(); world.close(); server.close();
   if (child?.exitCode === null) {
     child.stdin?.write('stop\n');
     await Promise.race([new Promise<void>(resolve => child!.once('exit', () => resolve())), delay(10000)]);
@@ -224,7 +236,7 @@ try {
       fail?.(error); console.error(error.message);
       initialized = false;
       // A dead world must not leave four agents spending tokens on stale observations.
-      void scheduler?.stop();
+      world.endAutonomy(); void scheduler?.stop();
       if (monitor) clearInterval(monitor);
       void scenario?.stop();
       world.close();
@@ -243,9 +255,9 @@ try {
       captureInitialSurvivalState(world, survival); survival.start(); survival.poll();
       monitor = setInterval(() => {
         try { observeSurvival(); survival.poll(); }
-        catch (error: any) { console.error(error.message); void scheduler?.stop(); }
+        catch (error: any) { console.error(error.message); world.endAutonomy(); void scheduler?.stop(); }
       }, 5000);
-      if (process.env.ANIMA_MC_AUTORUN !== 'false') scheduler?.start();
+      if (process.env.ANIMA_MC_AUTORUN !== 'false') world.startAutonomy(() => scheduler?.start());
       console.log(`Survival ready: ${world.memoryNamespace}; initial empty-handed start verified, current progress restored.`);
     } else if (dragon) {
       for (const actor of DRAGON_ROSTER) { world.add(actor.name, actor.persona, actor.roleId); await delay(500); }
@@ -256,9 +268,9 @@ try {
       dragon.openCages(world.bots.values()); dragon.start(); dragon.poll();
       monitor = setInterval(() => {
         try { dragon.poll(); dragon.openCages(world.bots.values()); }
-        catch (error: any) { console.error(error.message); void scheduler?.stop(); }
+        catch (error: any) { console.error(error.message); world.endAutonomy(); void scheduler?.stop(); }
       }, 5000);
-      if (process.env.ANIMA_MC_AUTORUN !== 'false') scheduler?.start();
+      if (process.env.ANIMA_MC_AUTORUN !== 'false') world.startAutonomy(() => scheduler?.start());
       console.log('Dragon trial ready: four native Mineflayer NPCs, CLIProxyAPI, persistent memories.');
     } else {
       world.add('LinChe', '林澈：温和、简短、重视承诺，喜欢安静探索，遇到困难会先观察再行动。');

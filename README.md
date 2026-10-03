@@ -115,6 +115,8 @@ npm run example:pi
 
 `npm run minecraft:survival` 启动独立的随机主世界，让四个人格空手开始普通生存并自主协作。已有世界运行时先用 `npm run minecraft:stop` 关闭旧实例。`minecraft:dragon` 保留为直接进入末地的辅助战斗诊断，不代表完整生存目标。身体动作由 Mineflayer 原生执行；`approach` 接近可见对象时使用 Pathfinder 的纯规划器，未加载其运动控制器。控制页支持四个 NPC 的第三人称实时画面切换，以及「进入游戏」启动本机原生客户端加入同一个世界；浏览器画面是实时世界数据重绘。
 
+默认启用双循环：pi 规划有期限的目标，本地身体持续执行技能并处理明确授权的自保；模型思考结束不会自动停止身体。人工停止、目标替换与到期均撤销旧授权。接口与控制权约定见 [身体控制契约](docs/body-controller-contract.md)。独立的 [小型技能考场](docs/minecraft-skill-exam.md) 在 25575 端口测试战斗、跑酷、搭桥、采集和中断恢复，区分技能参考计划与完整 Agent 成绩，不改动 25565 的生存世界。
+
 本机已配置并验证 EasyCLIProxyAPI 的 pi 工具调用，兼容接口地址为 `http://127.0.0.1:8317/v1`。项目通过 `ANIMA_*` 显式选择接口，未设置时仍读取本机 pi 的原有 provider；协作者需要准备自己的模型配置。示例见 `.env.example`，设计边界见 [世界接入工作说明](docs/world-integration-brief.md)。
 
 ### 分享代码

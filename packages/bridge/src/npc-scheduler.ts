@@ -12,7 +12,10 @@ export type SchedulerPhase = 'idle' | 'running' | 'stopping' | 'stopped' | 'comp
 export interface SchedulerOptions {
   getActors(): ActorState[];
   run(name: string, instruction: string, signal?: AbortSignal): Promise<unknown>;
+  /** Revoke all body authorization as well as the current reasoning turn. */
   cancel(name: string): void | Promise<void>;
+  /** A reasoning deadline may leave a separately authorized body goal running. */
+  cancelTurn?(name: string): void | Promise<void>;
   scenarioStatus(): ScenarioStatus;
   objective?: string;
   intervalMs?: number;
@@ -21,6 +24,9 @@ export interface SchedulerOptions {
   chatCooldownMs?: number;
   eventCooldownMs?: number;
   injuryCooldownMs?: number;
+  /** Disable planning hints and faster goal continuations for a same-code baseline. */
+  continuityEnabled?: boolean;
+  continuityCooldownMs?: number;
   mergeWindowMs?: number;
   errorBackoffMs?: number;
   maxErrorBackoffMs?: number;
@@ -51,11 +57,13 @@ type RunningTask = {
   timedOut: boolean;
   timeout?: ReturnType<typeof setTimeout>;
   cancellation?: Promise<void>;
+  actorCancellation?: Promise<void>;
 };
 
 // These already reach the active agent as tool results. Replaying them as new
 // wakeups would make a bot's own actions generate an endless decision loop.
-const ownResults = new Set(['said', 'action', 'task-started', 'task-finished', 'task-failed']);
+const ownResults = new Set(['said', 'action', 'task-started', 'task-finished', 'task-failed', 'skill-progress', 'body-tick']);
+const continuityEvents = new Set(['planning-needed', 'goal-finished', 'goal-blocked']);
 const QUEUE_LIMIT = 24;
 const SEEN_LIMIT = 128;
 const DEFAULT_OBJECTIVE = '与队友合作，击败当前世界中的末影龙。';
@@ -71,8 +79,12 @@ export class NpcScheduler {
   private options: SchedulerOptions;
   private schedules = new Map<string, ActorSchedule>();
   private active = new Map<string, RunningTask>();
+  private knownActors = new Set<string>();
+  private actorStops = new Map<string, Promise<void>>();
   private phase: SchedulerPhase = 'idle';
   private timer?: ReturnType<typeof setInterval>;
+  private dueTimer?: ReturnType<typeof setTimeout>;
+  private dueAt?: number;
   private stopping?: Promise<void>;
   private ticking = false;
   private now: () => number;
@@ -81,6 +93,7 @@ export class NpcScheduler {
   private settings: {
     intervalMs: number; pollMs: number; taskTimeoutMs: number;
     chatCooldownMs: number; eventCooldownMs: number; injuryCooldownMs: number; mergeWindowMs: number;
+    continuityEnabled: boolean; continuityCooldownMs: number;
     errorBackoffMs: number; maxErrorBackoffMs: number; stopWaitMs: number; maxConcurrent: number;
   };
 
@@ -94,6 +107,8 @@ export class NpcScheduler {
       chatCooldownMs: milliseconds(options.chatCooldownMs, 8000, 'chatCooldownMs'),
       eventCooldownMs: milliseconds(options.eventCooldownMs, 4000, 'eventCooldownMs'),
       injuryCooldownMs: milliseconds(options.injuryCooldownMs, 250, 'injuryCooldownMs'),
+      continuityEnabled: options.continuityEnabled ?? true,
+      continuityCooldownMs: milliseconds(options.continuityCooldownMs, 250, 'continuityCooldownMs'),
       mergeWindowMs: milliseconds(options.mergeWindowMs, 1000, 'mergeWindowMs'),
       errorBackoffMs: milliseconds(options.errorBackoffMs, 15000, 'errorBackoffMs'),
       maxErrorBackoffMs: milliseconds(options.maxErrorBackoffMs, 120000, 'maxErrorBackoffMs'),
@@ -106,11 +121,13 @@ export class NpcScheduler {
 
   private actors() {
     const names = new Set<string>();
-    return this.options.getActors().filter(actor => {
+    const actors = this.options.getActors().filter(actor => {
       if (!actor.name || names.has(actor.name)) return false;
       names.add(actor.name);
       return true;
     }).slice(0, 4);
+    for (const actor of actors) this.knownActors.add(actor.name);
+    return actors;
   }
 
   private schedule(name: string) {
@@ -128,9 +145,45 @@ export class NpcScheduler {
     return failure;
   }
 
+  private clearDueTimer() {
+    if (this.dueTimer) clearTimeout(this.dueTimer);
+    this.dueTimer = undefined;
+    this.dueAt = undefined;
+  }
+
+  /** One deadline timer avoids adding a poll period to a short continuation. */
+  private armDueTimer() {
+    if (this.phase !== 'running' || this.active.size >= this.settings.maxConcurrent) {
+      this.clearDueTimer();
+      return;
+    }
+    let dueAt = Infinity;
+    try {
+      for (const actor of this.actors()) {
+        if (actor.ready && !actor.busy && !this.active.has(actor.name) && !this.actorStops.has(actor.name)) {
+          dueAt = Math.min(dueAt, this.schedule(actor.name).nextRunAt);
+        }
+      }
+    } catch {
+      // The regular poll reports world outages; a failing read must not spin.
+      this.clearDueTimer();
+      return;
+    }
+    if (!Number.isFinite(dueAt)) { this.clearDueTimer(); return; }
+    if (this.dueTimer && this.dueAt === dueAt) return;
+    this.clearDueTimer();
+    this.dueAt = dueAt;
+    this.dueTimer = setTimeout(() => {
+      this.dueTimer = undefined;
+      this.dueAt = undefined;
+      this.tick();
+    }, Math.max(0, dueAt - this.now()));
+    this.dueTimer.unref?.();
+  }
+
   start() {
     if (this.phase === 'running') return;
-    if (this.phase === 'stopping' || this.active.size) throw new Error('Previous NPC tasks have not stopped.');
+    if (this.phase === 'stopping' || this.active.size || this.actorStops.size) throw new Error('Previous NPC tasks or bodies have not stopped.');
     this.phase = 'running';
     this.stopping = undefined;
     for (const state of this.schedules.values()) state.nextRunAt = this.now();
@@ -144,12 +197,25 @@ export class NpcScheduler {
     return this.finish('stopped');
   }
 
-  private requestCancellation(name: string, task: RunningTask) {
+  private requestTurnCancellation(name: string, task: RunningTask) {
     task.controller.abort();
     if (!task.cancellation) {
-      task.cancellation = Promise.resolve().then(() => this.options.cancel(name)).catch(error => { this.report(error, name); });
+      task.cancellation = this.options.cancelTurn
+        ? Promise.resolve().then(() => this.options.cancelTurn!(name)).catch(error => { this.report(error, name); })
+        : this.requestActorCancellation(name, task);
     }
     return task.cancellation;
+  }
+
+  private requestActorCancellation(name: string, task?: RunningTask) {
+    task?.controller.abort();
+    const previous = task?.actorCancellation ?? this.actorStops.get(name);
+    if (previous) return previous;
+    const cancellation = Promise.resolve().then(() => this.options.cancel(name)).catch(error => { this.report(error, name); })
+      .finally(() => { if (this.actorStops.get(name) === cancellation) this.actorStops.delete(name); });
+    this.actorStops.set(name, cancellation);
+    if (task) task.actorCancellation = cancellation;
+    return cancellation;
   }
 
   private finish(target: 'stopped' | 'completed'): Promise<void> {
@@ -158,11 +224,18 @@ export class NpcScheduler {
     this.phase = target === 'completed' ? 'completed' : 'stopping';
     if (this.timer) clearInterval(this.timer);
     this.timer = undefined;
+    this.clearDueTimer();
     const waiting: Promise<unknown>[] = [];
-    for (const [name, task] of this.active) {
+    // A persistent body may be working between reasoning turns, or may have
+    // disappeared from the current roster while its previous task drains.
+    try { this.actors(); } catch (error) { this.report(error); }
+    const names = new Set([...this.knownActors, ...this.active.keys()]);
+    for (const task of this.active.values()) {
       if (task.timeout) clearTimeout(task.timeout);
-      waiting.push(this.requestCancellation(name, task), task.settled);
+      task.controller.abort();
+      waiting.push(task.settled);
     }
+    for (const name of names) waiting.push(this.requestActorCancellation(name, this.active.get(name)));
     this.stopping = (async () => {
       let timer: ReturnType<typeof setTimeout> | undefined;
       try {
@@ -186,6 +259,7 @@ export class NpcScheduler {
   wake(name: string, event: WorldEvent) {
     if (this.phase !== 'idle' && this.phase !== 'running') return;
     if (!event || typeof event.type !== 'string' || ownResults.has(event.type)) return;
+    if (event.type === 'planning-needed' && !this.settings.continuityEnabled) return;
     const actors = this.actors();
     if (!actors.some(actor => actor.name === name)) return;
     if (event.type === 'heard' && event.speaker === name) return;
@@ -208,16 +282,43 @@ export class NpcScheduler {
     const urgent = !npcChat;
     const snapshot: WorldEvent = { ...event };
     if (typeof snapshot.message === 'string') snapshot.message = snapshot.message.slice(0, 500);
-    state.pending.push({ event: snapshot, urgent });
-    if (state.pending.length > QUEUE_LIMIT) { state.pending.shift(); state.droppedEvents += 1; }
+    const continuation = this.isContinuation(event);
+    // Multiple observations of the same plan/receipt need only one next turn.
+    // Coalescing is local to the pending queue so a later plan can request work.
+    const duplicate = continuation ? state.pending.findIndex(item => this.isContinuation(item.event)
+      && this.continuationKey(item.event) === this.continuationKey(event)) : -1;
+    if (duplicate >= 0) state.pending[duplicate] = { event: snapshot, urgent };
+    else state.pending.push({ event: snapshot, urgent });
+    this.trimPending(state);
     if (urgent && !this.active.has(name) && state.failures === 0) {
       const cooldown = this.eventCooldown(event);
-      const earliest = Math.max(now + this.settings.mergeWindowMs, (state.lastFinishedAt ?? -Infinity) + cooldown);
+      const merge = continuation ? Math.min(this.settings.mergeWindowMs, cooldown) : this.settings.mergeWindowMs;
+      const earliest = Math.max(now + merge, (state.lastFinishedAt ?? -Infinity) + cooldown);
       state.nextRunAt = Math.min(state.nextRunAt, earliest);
+    }
+    this.armDueTimer();
+  }
+
+  private isContinuation(event: WorldEvent) {
+    return this.settings.continuityEnabled && continuityEvents.has(event.type)
+      && !(event.type === 'goal-finished' && event.terminal === true);
+  }
+
+  private continuationKey(event: WorldEvent) {
+    return JSON.stringify([event.type, event.intentId, event.intentVersion, event.stepIndex, event.receiptId]);
+  }
+
+  private trimPending(state: ActorSchedule) {
+    while (state.pending.length > QUEUE_LIMIT) {
+      // Chat bursts must not evict the only pending request to extend a plan.
+      const ordinary = state.pending.findIndex(item => !this.isContinuation(item.event));
+      state.pending.splice(ordinary < 0 ? 0 : ordinary, 1);
+      state.droppedEvents += 1;
     }
   }
 
   private eventCooldown(event: WorldEvent) {
+    if (this.isContinuation(event)) return this.settings.continuityCooldownMs;
     if (event.type === 'heard') return this.settings.chatCooldownMs;
     // Only a real decrease in this actor's perceived health gets the faster
     // cadence. It still goes through tick(), the body lock and provider backoff.
@@ -235,7 +336,8 @@ export class NpcScheduler {
       this.schedulerError = undefined;
       if (this.scenario.complete) { void this.finish('completed'); return; }
       const now = this.now();
-      const actors = this.actors().filter(actor => actor.ready && !actor.busy && !this.active.has(actor.name));
+      const actors = this.actors().filter(actor => actor.ready && !actor.busy
+        && !this.active.has(actor.name) && !this.actorStops.has(actor.name));
       // Earlier due dates first prevent a fixed actor order from starving a bot
       // if an operator configures fewer than four concurrent model requests.
       actors.sort((left, right) => this.schedule(left.name).nextRunAt - this.schedule(right.name).nextRunAt);
@@ -249,6 +351,7 @@ export class NpcScheduler {
       this.schedulerError = failure.message;
     } finally {
       this.ticking = false;
+      if (!this.schedulerError) this.armDueTimer();
     }
   }
 
@@ -272,7 +375,7 @@ export class NpcScheduler {
     state.tasks += 1;
     task.timeout = setTimeout(() => {
       task.timedOut = true;
-      void this.requestCancellation(state.name, task);
+      void this.requestTurnCancellation(state.name, task);
     }, this.settings.taskTimeoutMs);
     task.timeout.unref?.();
     const instruction = this.instruction(state, events);
@@ -284,7 +387,9 @@ export class NpcScheduler {
       const outcome = result && typeof result === 'object' ? result as { status?: unknown; reason?: unknown; error?: unknown } : {};
       const budgetFinished = outcome.status === 'incomplete' && outcome.reason === 'budget' && !outcome.error;
       const worldInterrupted = outcome.status === 'cancelled' && outcome.reason === 'world-change' && !outcome.error;
-      if ((!budgetFinished && outcome.status === 'incomplete') || outcome.status === 'failed' || (outcome.status === 'cancelled' && !worldInterrupted)) {
+      const bodyReplan = outcome.status === 'cancelled' && outcome.reason === 'body-replan' && !outcome.error;
+      if ((!budgetFinished && outcome.status === 'incomplete') || outcome.status === 'failed'
+        || (outcome.status === 'cancelled' && !worldInterrupted && !bodyReplan)) {
         throw new Error(`NPC task ${outcome.status}.`);
       }
       state.failures = 0;
@@ -295,14 +400,14 @@ export class NpcScheduler {
       state.lastError = this.report(task.timedOut ? new Error('NPC task timed out.') : error, state.name).message;
       // Retain the perceived trigger when a provider call fails; it has not
       // necessarily entered the NPC's durable memory yet.
-      const pending = [...events, ...state.pending];
-      state.droppedEvents += Math.max(0, pending.length - QUEUE_LIMIT);
-      state.pending = pending.slice(-QUEUE_LIMIT);
+      state.pending = [...events, ...state.pending];
+      this.trimPending(state);
     }).finally(async () => {
       if (task.timeout) clearTimeout(task.timeout);
       // An asynchronous cancellation must not arrive after a replacement task
       // starts and accidentally cancel that newer task under the same name.
       if (task.cancellation) await task.cancellation;
+      if (task.actorCancellation) await task.actorCancellation;
       const now = this.now();
       state.lastFinishedAt = now;
       if (state.failures) {
@@ -316,6 +421,7 @@ export class NpcScheduler {
         state.nextRunAt = now + wait;
       }
       this.active.delete(state.name);
+      this.armDueTimer();
     });
   }
 
@@ -338,6 +444,7 @@ export class NpcScheduler {
       phase: this.phase, activeTasks: this.active.size,
       pendingEvents: schedules.reduce((sum, actor) => sum + actor.pendingEvents, 0),
       maxConcurrent: this.settings.maxConcurrent, intervalMs: this.settings.intervalMs,
+      continuityEnabled: this.settings.continuityEnabled, continuityCooldownMs: this.settings.continuityCooldownMs,
       scenario: { ...this.scenario }, error: this.schedulerError, actors: schedules,
     };
   }

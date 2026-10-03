@@ -5,9 +5,11 @@ const names = { Sheldon: '谢耳朵', Sherlock: '福尔摩斯', Deadpool: '死�
 const actions = { goto: '移动', move: '移动', look: '观察方向', say: '说话', broadcast: '世界频道', dig: '挖掘', place: '放置', wait: '等待', stop: '停止', attack: '近战攻击', shoot: '射击', equip: '装备', consume: '进食', use_item: '使用物品', interact: '交互', toss: '交付物品', scan: '观察资源', recipes: '查找配方', craft: '制作', gather: '采集', smelt: '冶炼', container: '整理容器', sleep: '睡觉' };
 const stages = { starting: '刚刚出生', resources: '取得资源', smelting: '取得铁锭', nether: '到达下界', end: '进入末地', victory: '完成屠龙' };
 const outcomes = { completed: '已执行', failed: '失败', cancelled: '已中断' };
-let token, sessionPromise, refreshBusy = false, operationBusy = false, experimentBusy = false;
+let token, sessionPromise, refreshPromise, experimentBusy = false;
 let currentBots = [], currentExperiment = {}, observations = new Map();
 let experience = {}, playBusy = false;
+const pendingOperations = new Set(), latestOperations = new Map(), operationResults = new Map();
+let operationSequence = 0;
 const camera = new CameraSession({
   visible: document.visibilityState !== 'hidden',
   onState: cameraState,
@@ -96,7 +98,7 @@ async function api(path, input, canRenew = true) {
   // executed, so it can safely be retried once after refreshing this session.
   if (response.status === 401 && canRenew) { await renewSession(); return api(path, input, false); }
   const data = await response.json();
-  if (!response.ok) throw new Error(data.error || '请求失败');
+  if (!response.ok) throw Object.assign(new Error(data.error || data.reason || '请求失败'), { status: response.status });
   return data;
 }
 function element(tag, text, className) {
@@ -205,12 +207,28 @@ function renderCast() {
   }));
   if (!currentBots.length) $('cast').append(element('p', '等待角色进入世界…', 'empty'));
 }
+function controlAvailability(bot) {
+  const dual = Boolean(bot?.control && bot.control.enabled !== false);
+  const pending = kind => pendingOperations.has(`${bot?.name}:${kind}`);
+  const unavailable = !bot?.ready || pending('stop');
+  const autoRunning = experimentBusy || ['running', 'stopping'].includes(currentExperiment.scheduler?.phase);
+  const brainBusy = bot?.brainBusy || bot?.taskId || pending('task');
+  const legacyBusy = bot?.busy || pending('task') || pending('move') || pending('say');
+  const manualBusy = autoRunning || (dual ? brainBusy || pending('move') : legacyBusy);
+  return { dual, task: !unavailable && !manualBusy,
+    move: !unavailable && !manualBusy && (!dual || Number.isSafeInteger(bot.control.version) && !bot.control.disposed),
+    say: !unavailable && (dual ? !pending('say') : !autoRunning && !legacyBusy),
+    stop: Boolean(bot?.ready) && !pending('stop') };
+}
 function renderSelected() {
   renderCamera();
-  const bot = currentBots.find(item => item.name === $('bot').value);
-  const autoRunning = currentExperiment.scheduler?.phase === 'running';
-  for (const id of ['task', 'say', 'move']) $(id).disabled = operationBusy || !bot?.ready || bot.busy || autoRunning;
-  $('stop').disabled = !bot?.ready || !bot.busy;
+  const bot = currentBots.find(item => item.name === $('bot').value), available = controlAvailability(bot);
+  for (const id of ['task', 'say', 'move', 'stop']) $(id).disabled = !available[id];
+  $('stop').textContent = '停止角色';
+  $('stop').title = '停止思考，并撤销身体目标与自保授权。';
+  $('move').textContent = available.dual && bot.control.stopped ? '恢复并走到坐标' : '走到坐标';
+  $('move').title = available.dual ? '提交最长30秒的新移动目标，替换当前身体目标；不会恢复旧任务或自动授权自保。' : '直接执行移动。';
+  $('result').textContent = operationResults.get(bot?.name) || '选择角色，可以查看近期经历和实际行动结果。';
   if (!bot) return;
   $('persona').textContent = bot.persona;
   const observation = observations.get(bot.name);
@@ -225,10 +243,15 @@ function renderSelected() {
   }));
   if (!events.length) $('events').append(element('p', bot.ready ? '还没有新的经历。' : '角色目前未在线。', 'empty'));
 }
-async function refresh() {
-  if (refreshBusy) return;
-  refreshBusy = true;
-  try {
+async function refresh(force = false) {
+  if (refreshPromise) {
+    await refreshPromise;
+    if (!force) return;
+    // A request made before a mutation may contain an older version. After a
+    // conflict/stop, wait for that refresh and then read a fresh snapshot.
+    return refresh(true);
+  }
+  refreshPromise = (async () => { try {
     const [botsResult, experiment, liveExperience] = await Promise.all([api('bots'), api('experiment'), api('experience')]);
     experience = liveExperience;
     if (currentExperiment.scenario?.worldId !== experiment.scenario?.worldId) observations.clear();
@@ -248,45 +271,63 @@ async function refresh() {
   } catch (error) {
     $('health').textContent = '连接中断 · ' + error.message;
     for (const id of ['task', 'say', 'move', 'experiment-start']) $(id).disabled = true;
-  } finally { refreshBusy = false; }
+  } finally { refreshPromise = undefined; } })();
+  return refreshPromise;
 }
-async function operate(endpoint, input) {
-  if (operationBusy) return;
+async function operate(kind, endpoint, input) {
   const name = $('bot').value;
-  if (!name) return;
-  operationBusy = true; renderSelected(); $('result').textContent = '角色正在执行…';
+  const bot = currentBots.find(item => item.name === name);
+  if (!name || !controlAvailability(bot)[kind]) return;
+  const key = `${name}:${kind}`, request = ++operationSequence;
+  pendingOperations.add(key); latestOperations.set(name, request);
+  const report = message => {
+    // A late response from an older task must not overwrite a newer stop, nor
+    // write another selected actor's feedback into the current panel.
+    if (latestOperations.get(name) !== request) return;
+    operationResults.set(name, message);
+    if ($('bot').value === name) $('result').textContent = message;
+  };
+  report(kind === 'stop' ? '正在停止角色…' : kind === 'task' ? '角色正在思考…' : '正在提交…');
+  renderSelected();
   try {
-    const result = await api(`bots/${encodeURIComponent(name)}/${endpoint}`, input);
-    $('result').textContent = result.reply ? result.reply + '\n\n' + JSON.stringify(result.actions, null, 2) : JSON.stringify(result, null, 2);
-  } catch (error) { $('result').textContent = error.message; }
-  finally { operationBusy = false; await refresh(); renderSelected(); }
+    // A versioned intent is tied to the displayed session/snapshot. Even a
+    // service restart must not silently replay it after renewing credentials.
+    const result = await api(`bots/${encodeURIComponent(name)}/${endpoint}`, input, endpoint !== 'intent');
+    if (endpoint === 'intent' && result.accepted !== true) throw Object.assign(new Error('目标未被接收。'), { status: 409 });
+    report(kind === 'stop' ? '角色已停止思考，身体目标与自保授权已撤销。'
+      : endpoint === 'intent' ? '已接收移动目标；是否到达请查看实际画面和行动回执。\n\n' + JSON.stringify(result, null, 2)
+      : result.reply ? result.reply + '\n\n' + JSON.stringify(result.actions, null, 2) : JSON.stringify(result, null, 2));
+  } catch (error) {
+    report(error.status === 409 ? '控制状态已变化；请查看刷新后的状态，再次点击确认新操作。'
+      : endpoint === 'intent' && error.status === 401 ? '服务会话已变化；请查看刷新后的状态，再次点击确认新目标。' : error.message);
+  } finally { await refresh(true); pendingOperations.delete(key); renderSelected(); }
 }
 async function experiment(action) {
   if (experimentBusy) return;
-  experimentBusy = true; renderExperiment();
+  experimentBusy = true; renderExperiment(); renderSelected();
   $('experiment-result').textContent = action === 'start' ? '正在唤醒四名角色…' : '正在结束当前思考与行动…';
   try {
     await api(`experiment/${action}`, {});
     $('experiment-result').textContent = action === 'start' ? '持续协作已开始。真实世界达到目标后会自动结束。' : '已暂停 NPC 持续调度。世界与已有记录保留。';
   } catch (error) { $('experiment-result').textContent = error.message; }
-  finally { experimentBusy = false; await refresh(); renderExperiment(); }
+  finally { experimentBusy = false; await refresh(true); renderExperiment(); renderSelected(); }
 }
 $('experiment-start').onclick = () => experiment('start');
 $('experiment-stop').onclick = () => experiment('stop');
-$('task').onclick = () => operate('tasks', { instruction: $('instruction').value });
-$('stop').onclick = async () => {
-  const name = $('bot').value;
-  if (!name) return;
-  $('stop').disabled = true;
-  try { await api(`bots/${encodeURIComponent(name)}/stop`, {}); $('result').textContent = '已请求中断当前一轮。'; }
-  catch (error) { $('result').textContent = error.message; }
-  finally { await refresh(); }
-};
-$('say').onclick = () => operate('actions', { type: 'say', message: $('message').value });
+$('task').onclick = () => operate('task', 'tasks', { instruction: $('instruction').value });
+$('stop').onclick = () => operate('stop', 'stop', {});
+$('say').onclick = () => operate('say', 'actions', { type: 'say', message: $('message').value });
 $('message').onkeydown = event => { if (event.key === 'Enter' && !$('say').disabled) $('say').click(); };
 $('move').onclick = () => {
   if (['x', 'y', 'z'].some(id => !$(id).value.trim())) { $('result').textContent = '请填写完整的 X、Y、Z 坐标。'; return; }
-  void operate('actions', { type: 'goto', x: Number($('x').value), y: Number($('y').value), z: Number($('z').value) });
+  const target = { type: 'goto', x: Number($('x').value), y: Number($('y').value), z: Number($('z').value) };
+  if (!['x', 'y', 'z'].every(key => Number.isFinite(target[key]))) { $('result').textContent = '坐标必须是有效数字。'; return; }
+  const bot = currentBots.find(item => item.name === $('bot').value);
+  if (controlAvailability(bot).dual) return operate('move', 'intent', {
+    expectedVersion: bot.control.version, label: '手动移动', steps: [target], reactions: [], ttlMs: 30000,
+    ...(bot.control.stopped === true ? { resume: true } : {}),
+  });
+  return operate('move', 'actions', target);
 };
 $('bot').onchange = () => { renderSelected(); renderCast(); };
 $('viewer-retry').onclick = () => camera.select(experience.viewer?.url, $('bot').value, { force: true });

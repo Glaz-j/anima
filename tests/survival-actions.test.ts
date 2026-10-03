@@ -13,7 +13,7 @@ import { blockProperties, BLOCK_PROPERTY_BUDGET } from '../adapters/minecraft/sr
 import { action } from '../adapters/minecraft/src/validation.ts';
 import { nativeWalkTo, runNativeAction } from '../adapters/minecraft/src/native-actions.ts';
 import { droppedItemSummary } from '../adapters/minecraft/src/entity-observation.ts';
-import { runSurvivalAction } from '../adapters/minecraft/src/survival-actions.ts';
+import { copyGatherState, runSurvivalAction } from '../adapters/minecraft/src/survival-actions.ts';
 import { synchronizeCraftInventory } from '../adapters/minecraft/src/craft-sync.ts';
 import { managedWindowOperation, releaseUnmanagedWindow, windowlessInteraction } from '../adapters/minecraft/src/window-lifecycle.ts';
 
@@ -670,6 +670,96 @@ test('gather never guesses drops and refuses harvest-restricted blocks without a
   assert.equal(result.minedBlocks, 1); assert.equal(result.pickupConfirmed, false); assert.deepEqual(result.inventoryDelta, []);
   block('iron_ore', position, { harvestTools: { 999: true } });
   await assert.rejects(run({ type: 'gather', block: 'iron_ore' }), /没有能获取/);
+});
+
+test('survival failures expose stable machine causes without discarding actual partial progress', async () => {
+  const { bot, block, blocks, bag, run } = fixture();
+  await assert.rejects(run({ type: 'gather', block: 'invented_block' }), (error: any) => error.details.stoppedReason === 'invalid_block');
+  await assert.rejects(run({ type: 'gather', block: 'oak_log' }), (error: any) => error.details.stoppedReason === 'no_visible_resource');
+  const target = new Vec3(2, 64, 0);
+  block('iron_ore', target, { harvestTools: { 999: true } });
+  await assert.rejects(run({ type: 'gather', block: 'iron_ore' }), (error: any) => error.details.stoppedReason === 'missing_tool');
+  block('oak_log', target); bot.dig = async () => {};
+  await assert.rejects(run({ type: 'gather', block: 'oak_log' }), (error: any) => error.details.stoppedReason === 'server_unconfirmed');
+  bot.dig = async (found: any) => { blocks.delete(found.position.toString()); bag.set('oak_log', 1); };
+  await assert.rejects(run({ type: 'gather', block: 'oak_log', count: 2 }), (error: any) => {
+    assert.equal(error.details.stoppedReason, 'candidates_exhausted'); assert.equal(error.details.minedBlocks, 1);
+    assert.deepEqual(error.details.inventoryDelta, [{ item: 'oak_log', change: 1 }]); return true;
+  });
+  bag.clear();
+  await assert.rejects(run({ type: 'craft', item: 'oak_planks' }), (error: any) => {
+    assert.equal(error.details.stoppedReason, 'missing_prerequisites');
+    assert.equal(error.details.prerequisite, 'materials_or_crafting_table');
+    assert.deepEqual(error.details.prerequisites.options[0].materials, [{ item: 'oak_log', required: 1, available: 0, missing: 1 }]); return true;
+  });
+  await assert.rejects(run({ type: 'craft', item: 'oak_planks', table: { x: 2, y: 64, z: 0 } }),
+    (error: any) => error.details.stoppedReason === 'missing_prerequisites' && error.details.prerequisite === 'reachable_crafting_table');
+});
+
+test('gather rechecks a changed target after awaited aim and never digs the old block', async () => {
+  const { bot, block, blocks, run } = fixture(), target = new Vec3(2, 64, 0);
+  block('oak_log', target);
+  bot.lookAt = async () => { blocks.delete(target.toString()); };
+  bot.dig = async () => assert.fail('A target changed during aiming must not be dug.');
+  await assert.rejects(run({ type: 'gather', block: 'oak_log' }), (error: any) => {
+    assert.equal(error.details.stoppedReason, 'target_changed'); assert.equal(error.details.minedBlocks, 0); return true;
+  });
+});
+
+test('gather continuation keeps its first search origin and does not mine newly nearby resources outside that area', async () => {
+  const { bot, block, blocks, bag } = fixture(), first = new Vec3(7, 64, 0), outside = new Vec3(10, 64, 0);
+  const initial = { ...bot.entity.position }, searches: Vec3[] = [];
+  block('oak_log', first); block('oak_log', outside);
+  bot.findBlocks = ({ matching, point, maxDistance }: any) => {
+    searches.push(point.clone());
+    return [...blocks.values()].filter(found => found.type === matching && found.position.distanceTo(point) <= maxDistance).map(found => found.position);
+  };
+  const controls = { approachBlock: async () => { bot.entity.position = new Vec3(6.5, 64, .5); }, moveTo: async () => {}, entityVisible: () => true };
+  bot.dig = async (found: any) => { assert.ok(found.position.equals(first)); blocks.delete(found.position.toString()); bag.set('oak_log', 1); };
+  const proposal = action({ type: 'gather', block: 'oak_log', maxDistance: 8 });
+  const firstReceipt: any = await runSurvivalAction(bot, proposal, new AbortController().signal, controls);
+  assert.deepEqual(firstReceipt.gatherState.origin, initial);
+  await assert.rejects(runSurvivalAction(bot, { ...proposal, gatherState: firstReceipt.gatherState }, new AbortController().signal, controls), (error: any) => {
+    assert.equal(error.details.stoppedReason, 'candidates_exhausted'); assert.deepEqual(error.details.gatherState.origin, initial); return true;
+  });
+  assert.ok(searches.every(point => point.equals(new Vec3(initial.x, initial.y, initial.z))));
+  assert.equal(blocks.get(outside.toString())?.name, 'oak_log');
+});
+
+test('gather remembers rejected candidates and shares approach budget across successful skill slices', async () => {
+  const { bot, block, blocks, bag } = fixture(), blocked = new Vec3(0, 70, 0), first = new Vec3(7, 64, 0), second = new Vec3(14, 64, 0);
+  block('oak_log', blocked); block('oak_log', first); block('oak_log', second);
+  const approached: number[] = [];
+  const controls = { approachBlock: async (position: any) => {
+    approached.push(position.x);
+    if (position.y === 70) throw new Error('This observed high candidate has no local approach.');
+    bot.entity.position = new Vec3(position.x - .5, 64, .5);
+  }, moveTo: async () => {}, entityVisible: () => true };
+  bot.dig = async (found: any) => { blocks.delete(found.position.toString()); bag.set('oak_log', (bag.get('oak_log') || 0) + 1); };
+  const proposal = action({ type: 'gather', block: 'oak_log', maxDistance: 24 });
+  const firstReceipt: any = await runSurvivalAction(bot, proposal, new AbortController().signal, controls);
+  assert.equal(firstReceipt.gatherState.movementAttempts, 2);
+  const secondReceipt: any = await runSurvivalAction(bot, { ...proposal, gatherState: firstReceipt.gatherState }, new AbortController().signal, controls);
+  assert.deepEqual(approached, [0, 7, 14]); assert.equal(secondReceipt.gatherState.movementAttempts, 3);
+  block('oak_log', new Vec3(21, 64, 0));
+  await assert.rejects(runSurvivalAction(bot, { ...proposal, gatherState: secondReceipt.gatherState }, new AbortController().signal, controls), (error: any) => {
+    assert.equal(error.details.stoppedReason, 'candidates_exhausted'); assert.equal(error.details.gatherState.movementAttempts, 3); return true;
+  });
+  assert.deepEqual(approached, [0, 7, 14], 'The next slice does not manufacture a new movement budget.');
+});
+
+test('gather cancelled approach returns its spent continuation budget and accepts no model-supplied continuation state', async () => {
+  const { bot, block } = fixture(); block('oak_log', new Vec3(7, 64, 0));
+  const controller = new AbortController(), proposal = action({ type: 'gather', block: 'oak_log', maxDistance: 16 });
+  await assert.rejects(runSurvivalAction(bot, proposal, controller.signal, {
+    approachBlock: async () => { controller.abort(); }, moveTo: async () => {}, entityVisible: () => true,
+  }), (error: any) => {
+    assert.equal(error.details.stoppedReason, 'cancelled'); assert.equal(error.details.gatherState.movementAttempts, 1);
+    assert.deepEqual(error.details.gatherState.attemptedTargets, ['(7, 64, 0)']); return true;
+  });
+  assert.equal(action({ ...proposal, gatherState: { origin: { x: 200, y: 64, z: 200 }, attemptedTargets: [], movementAttempts: 0 } }).gatherState, undefined);
+  assert.equal(copyGatherState({ origin: { x: NaN, y: 64, z: 0 }, attemptedTargets: [], movementAttempts: 0 }), undefined);
+  assert.equal(copyGatherState({ origin: { x: 0, y: 64, z: 0 }, attemptedTargets: [], movementAttempts: 4 }), undefined);
 });
 
 test('gather skips the nearest supporting stone and mines a legal adjacent candidate', async () => {

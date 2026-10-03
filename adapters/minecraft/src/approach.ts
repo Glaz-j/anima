@@ -243,8 +243,14 @@ async function navigate(bot: any, proposal: any, signal: AbortSignal, controls: 
       let plan: any;
       do { check(); plan = search.compute(); if (plan.status === 'partial') await yieldTurn(); } while (plan.status === 'partial');
       check();
-      if (plan.status !== 'success') throw failure(plan.status === 'timeout' ? 'planning_budget' : 'no_path',
+      const routeFailure = plan.status === 'success' ? undefined : failure(plan.status === 'timeout' ? 'planning_budget' : 'no_path',
         travel ? '本次有界规划未找到通往目标区域的已知落脚路线；未知地形与其他路线仍未验证。' : '本次有界规划未找到可交互站位；未知地形与其他路线仍未验证。');
+      // AStar retains its best reachable path on noPath. Travel may take that
+      // existing prefix once if it advances toward the requested XZ, without
+      // turning the reachable endpoint into a new goal or starting exploration.
+      const recovering = travel && plan.status === 'noPath' && plan.path.length > 0
+        && reach(plan.path.at(-1).offset(.5, 0, .5), snapshot) <= reach(bot.entity.position, snapshot) - .5;
+      if (routeFailure && !recovering) throw routeFailure;
       // An empty successful path means the cell centre is a valid goal, not that
       // the actual offset body is already centred/grounded/stationary.
       const route = plan.path.length ? plan.path : [new Move(start.x, start.y, start.z, 0, 0)];
@@ -256,6 +262,8 @@ async function navigate(bot: any, proposal: any, signal: AbortSignal, controls: 
         const next = node.offset(.5, 0, .5);
         if (travelled + bot.entity.position.distanceTo(next) > limits.distance) throw failure('movement_budget', '本次靠近的移动预算已用完。');
         if (!standable(next)) break; // Replan a changed wall/floor without issuing a move into it.
+        if (recovering && (!lineClear(get, eyes(bot.entity.position), next.offset(0, .01, 0))
+          || !lineClear(get, eyes(bot.entity.position), next.offset(0, 1.5, 0)))) break;
         const before = bot.entity.position.clone(); legs++;
         const legController = new AbortController(), forwardAbort = () => legController.abort(controller.signal.reason);
         controller.signal.addEventListener('abort', forwardAbort, { once: true });
@@ -278,6 +286,7 @@ async function navigate(bot: any, proposal: any, signal: AbortSignal, controls: 
         check(); refresh();
         if (arrived()) return summary(true);
       }
+      if (routeFailure) throw routeFailure;
     }
     throw failure('movement_budget', '本次靠近的重规划或移动预算已用完。');
   } catch (error: any) {

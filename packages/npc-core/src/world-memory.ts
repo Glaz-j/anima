@@ -12,6 +12,17 @@ export interface WorldProgressState {
   inventory?: Record<string, number>;
 }
 export interface WorldInformationCheck { query: string; fingerprint: string; }
+export interface WorldActionProgress {
+  /** Native receipt ID; stable across event, tool and controller snapshots. */
+  id: string; action: string; status: 'completed' | 'failed' | 'cancelled';
+  /** A revoked skill may still return a completed physical operation while draining. */
+  nativeStatus?: 'completed' | 'failed' | 'cancelled';
+  error?: string; stoppedReason?: string;
+  /** Original body authorization, never an attribution to the latest goal. */
+  intentId?: string; intentVersion?: number; reaction?: string; finishedAt?: number;
+  blockChanges: number;
+  results?: Record<string, boolean | number>;
+}
 export interface WorldTurnProgress {
   version: 1; start: WorldProgressState; end: WorldProgressState; actions: Record<string, number>;
   checks: WorldInformationCheck[]; failures: string[]; blockChanges: number;
@@ -19,6 +30,8 @@ export interface WorldTurnProgress {
   inventoryChanges: { item: string; change: number }[];
   /** Observed changes only: no inferred cause, tactical plan or success claim. */
   situationChanges: string[];
+  /** Each real receipt is accounted once, including receipts arriving between turns. */
+  actionReceipts?: WorldActionProgress[];
 }
 export interface WorldMemoryEntry {
   id: string; npcId: string; roleId: string; worldId?: string; kind: MemoryKind;
@@ -176,9 +189,10 @@ export class WorldMemory {
       : ['say', 'broadcast'].includes(action.type) ? '聊天回执仅说明发送操作，不证明别人听见、相信或记住。'
       : ['attack', 'shoot'].includes(action.type) ? '攻击/射击完成仅表示操作结束；attempts/shot不是命中或击杀证据，仅按details中的健康变化或明确确认判断。'
         : '仅按回执状态记录，失败或取消不表示目标完成。';
-    return this.add('fact', `${note}\n${JSON.stringify({ action, status: receipt.status, error: receipt.error, vitals: receipt.details?.vitals,
+    const ownership = receipt.bodyIntent ? '此回执归属bodyIntent中的原授权：status是实际操作结果，controlStatus是授权生命周期结果。旧授权取消后的真实局部成果仍保留，但不表示当前目标或步骤完成。\n' : '';
+    return this.add('fact', `${ownership}${note}\n${JSON.stringify({ action, status: receipt.status, error: receipt.error, vitals: receipt.details?.vitals,
       details: receipt.details ?? receipt.detail, confirmedHealthChange: receipt.confirmedHealthChange,
-      before: receipt.before, after: receipt.after })}`,
+      before: receipt.before, after: receipt.after, bodyIntent: receipt.bodyIntent })}`,
       sourceId || (receipt.id ? `action:${receipt.id}` : undefined), time);
   }
 
@@ -276,16 +290,21 @@ export class WorldMemory {
   }
 
   /** Deterministic reflection, not an autonomous strategy or a rewritten goal. */
-  progressContext(current?: WorldProgressState, currentChanges: string[] = [], budget = 2200) {
+  progressContext(current?: WorldProgressState, currentChanges: string[] = [], budget = 2200, pending?: WorldTurnProgress) {
     const reportEntries = this.entries.filter(entry => entry.progress?.version === 1);
     const selected = reportEntries.slice(-6), reports = selected.map(entry => entry.progress!);
+    // Body work can finish between reasoning turns. Include newly consumed
+    // receipts in this review before the current turn's report is persisted.
+    const hasPending = !!pending?.actionReceipts?.length;
+    if (hasPending) reports.push(pending!);
     if (!reports.length && !currentChanges.length) return '尚无多轮执行记录。';
     const rows = reports.map(report => {
       const delta = inventoryChanges(report.start, report.end);
       const moved = report.start.dimension === report.end.dimension && report.start.position && report.end.position
         ? Math.round(Math.hypot(...(['x', 'y', 'z'] as const).map(key => report.end.position![key] - report.start.position![key]))) : undefined;
       return { actions: report.actions, inventoryDelta: delta.slice(0, 6), receiptInventoryDelta: report.inventoryChanges.slice(0, 4),
-        blockChanges: report.blockChanges, displacement: moved, situationChanges: report.situationChanges.slice(-3), failures: report.failures.slice(-2) };
+        blockChanges: report.blockChanges, displacement: moved, situationChanges: report.situationChanges.slice(-3), failures: report.failures.slice(-2),
+        ...(report.actionReceipts?.length ? { actualReceipts: report.actionReceipts.slice(-2) } : {}) };
     });
     const materialChange = (report: WorldTurnProgress) => report.blockChanges > 0
       || [...inventoryChanges(report.start, report.end), ...report.inventoryChanges].some(item => item.change > 0);
@@ -324,7 +343,7 @@ export class WorldMemory {
       ...(changed.length ? [`重大情境变化：${JSON.stringify(changed)}。先结合当前身体和环境，自主复核旧goal/plan是否还适用；旧打算不是必须继续执行的命令。`] : []),
       ...(repeated.length || unchanged >= 3 ? [`需要反思：最近连续${unchanged}轮没有记录到背包新增或方块改动；重复返回相同结果的查询：${JSON.stringify(repeated)}。这不证明探索无价值或目标不可达。检查正在依赖的假设；决定继续的理由、换一种可验证的尝试或修改goal/plan，别仅把同一计划再说一遍。`] : []),
     ];
-    const header = `近期死亡与资源保有：${JSON.stringify(retention)}\n净变化比较窗口首末实际背包；减少可能来自消耗、转移或丢失，不推断原因或资源价值。未知库存不算空包；采集回执仍保留在下方。\n${warnings.join('\n')}\n最近${reports.length}轮真实变化（较旧在前；移动/扫描/聊天次数不等于资源进展；位移不是完整路径）：\n`;
+    const header = `近期死亡与资源保有：${JSON.stringify(retention)}\n净变化比较窗口首末实际背包；减少可能来自消耗、转移或丢失，不推断原因或资源价值。未知库存不算空包；采集回执仍保留在下方。\n${warnings.join('\n')}\n最近${reports.length}轮真实变化（较旧在前；移动/扫描/聊天次数不等于资源进展；位移不是完整路径）${hasPending ? '，末项含本轮新接收的异步回执' : ''}。回执按首次接收轮去重，可能源于上一轮或已撤销的intent；保留实际成果不代表当前目标完成：\n`;
     const room = Math.max(0, budget - header.length - 40);
     // Keep complete records, dropping older ones instead of cutting JSON.
     while (rows.length > 1 && JSON.stringify(rows).length > room) rows.shift();

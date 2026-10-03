@@ -6,6 +6,25 @@ import { craftWindowState, synchronizeCraftInventory } from './craft-sync.ts';
 import { managedWindowOperation, releaseUnmanagedWindow } from './window-lifecycle.ts';
 
 export const SURVIVAL_ACTIONS = new Set(['scan', 'recipes', 'craft', 'gather', 'smelt', 'container', 'sleep']);
+const failure = (code: string, message: string, details: any = {}) => Object.assign(new Error(message),
+  { details: { ...details, stoppedReason: code } });
+export interface GatherState {
+  origin: { x: number; y: number; z: number };
+  attemptedTargets: string[];
+  movementAttempts: number;
+}
+/** Internal continuation state from our own previous receipt, never a model tool argument. */
+export function copyGatherState(value: unknown): GatherState | undefined {
+  const state = value as GatherState | undefined;
+  if (!state || !state.origin || !['x', 'y', 'z'].every(key => Number.isFinite((state.origin as any)[key])
+      && Math.abs((state.origin as any)[key]) <= 30000000)
+    || !Array.isArray(state.attemptedTargets) || state.attemptedTargets.length > 128
+    || !state.attemptedTargets.every(target => typeof target === 'string' && target.length <= 80
+      && /^\(-?\d+, -?\d+, -?\d+\)$/u.test(target))
+    || !Number.isInteger(state.movementAttempts) || state.movementAttempts < 0 || state.movementAttempts > 3) return undefined;
+  return { origin: { x: state.origin.x, y: state.origin.y, z: state.origin.z },
+    attemptedTargets: [...new Set(state.attemptedTargets)], movementAttempts: state.movementAttempts };
+}
 export interface SurvivalControls {
   moveTo(bot: any, target: Vec3, signal: AbortSignal, radius?: number): Promise<void>;
   // The production body plans a route to interaction range of this observed
@@ -38,7 +57,7 @@ function item(bot: any, name: string, required = 1) {
 }
 function knownItem(bot: any, name: string) {
   const found = bot.registry.itemsByName[nameOf(name)];
-  if (!found) throw new Error(`不存在这个物品 ID：${name}。请使用实际注册表中的物品名称。`);
+  if (!found) throw failure('invalid_item', `不存在这个物品 ID：${name}。请使用实际注册表中的物品名称。`);
   return found;
 }
 function blockAtReach(bot: any, position: any, expected?: string[]) {
@@ -80,6 +99,23 @@ function recipeInfo(bot: any, recipe: any) {
   }));
   return { result: { item: bot.registry.items[recipe.result.id]?.name, count: recipe.result.count }, requiresTable: Boolean(recipe.requiresTable), materials,
     hasMaterials: materials.every((entry: any) => (inventory.get(entry.item) || 0) >= entry.count) };
+}
+
+function craftPrerequisites(bot: any, output: any, table: any) {
+  // This is static recipe data plus our already synchronized inventory. Return
+  // a small useful sample with the failure so replanning needs no extra scan.
+  try {
+    const inventory = counts(bot);
+    const options = bot.recipesAll(output.id, null, true).map((recipe: any) => {
+      const info = recipeInfo(bot, recipe);
+      return { result: info.result, requiresTable: info.requiresTable, tableAvailable: Boolean(table),
+        materials: info.materials.slice(0, 9).map((entry: any) => ({ item: entry.item, required: entry.count,
+          available: inventory.get(entry.item) || 0, missing: Math.max(0, entry.count - (inventory.get(entry.item) || 0)) })) };
+    });
+    const missing = (option: any) => option.materials.reduce((sum: number, material: any) => sum + material.missing, 0);
+    options.sort((a: any, b: any) => missing(a) - missing(b));
+    return { options: options.slice(0, 3), note: '仅列出最多三个配方的一批材料要求；不代表已经找到或靠近工作台，其他配方仍可能可用。' };
+  } catch { return undefined; }
 }
 
 function scan(bot: any, proposal: any, controls: SurvivalControls) {
@@ -137,17 +173,21 @@ function scan(bot: any, proposal: any, controls: SurvivalControls) {
 
 async function gather(bot: any, proposal: any, signal: AbortSignal, controls: SurvivalControls, details: any) {
   const blockName = nameOf(proposal.block), definition = bot.registry.blocksByName[blockName];
-  if (!definition) throw new Error(`不存在这个方块 ID：${blockName}。`);
-  const origin = bot.entity.position.clone();
+  if (!definition) throw failure('invalid_block', `不存在这个方块 ID：${blockName}。`);
+  const previous = copyGatherState(proposal.gatherState);
+  if (proposal.gatherState !== undefined && !previous) throw failure('invalid_gather_state', '采集续接状态无效；需要重新授权，不能重置范围或重试预算。');
+  const state: GatherState = previous ?? { origin: { ...bot.entity.position }, attemptedTargets: [], movementAttempts: 0 };
+  const origin = vector(state.origin);
+  details.gatherState = state;
   details.requestedBlocks = proposal.count; details.minedBlocks = 0; details.positions = [];
   details.rejectedCandidates = [];
-  let movementAttempts = 0;
+  details.movementAttempts = state.movementAttempts;
   const reject = (position: Vec3, reason: string, standingPosition?: Vec3, movement?: any) => {
     details.rejectedCandidateCount = (details.rejectedCandidateCount || 0) + 1;
     if (details.rejectedCandidates.length < 12) details.rejectedCandidates.push({ position: { ...position }, reason,
       ...(standingPosition ? { standingPosition: { ...standingPosition } } : {}), ...(movement ? { movement } : {}) });
   };
-  const attempted = new Set<string>();
+  const attempted = new Set(state.attemptedTargets);
   for (let index = 0; index < proposal.count; index++) {
     check(signal);
     const positions: Vec3[] = bot.findBlocks({ matching: definition.id, point: origin, maxDistance: proposal.maxDistance, count: 64 });
@@ -159,18 +199,21 @@ async function gather(bot: any, proposal: any, signal: AbortSignal, controls: Su
       a.distanceTo(bot.entity.position) - b.distanceTo(bot.entity.position));
     details.searchIncomplete = true;
     if (!eligible.length) {
-      throw new Error(`本次已加载候选中未找到可见且未尝试的 ${blockName}；已确认挖掉 ${details.minedBlocks}/${proposal.count} 块。未证明全半径覆盖，遮挡、未加载或未检查的位置仍未知。`);
+      throw failure(attempted.size ? 'candidates_exhausted' : 'no_visible_resource',
+        `本次已加载候选中未找到可见且未尝试的 ${blockName}；已确认挖掉 ${details.minedBlocks}/${proposal.count} 块。未证明全半径覆盖，遮挡、未加载或未检查的位置仍未知。`);
     }
     let position: Vec3 | undefined;
     for (const candidatePosition of eligible.slice(0, 8)) {
       check(signal);
+      if (attempted.size >= 128) throw failure('candidates_exhausted', '本任务已达到有限候选检查预算；其他位置或路线仍未知。');
       attempted.add(candidatePosition.toString());
+      state.attemptedTargets = [...attempted];
       details.selectedTarget = { ...candidatePosition };
       const reachable = () => candidatePosition.equals(bot.entity.position.floored().offset(0, -1, 0)) ? false :
         bot.blockAt(candidatePosition)?.name === blockName && withinDigReach(bot, bot.blockAt(candidatePosition));
       if (reachable()) { position = candidatePosition; break; }
-      if (movementAttempts >= 3) { reject(candidatePosition, '本次采集的接近尝试预算已用完。'); continue; }
-      check(signal); movementAttempts++; details.movementAttempts = movementAttempts;
+      if (state.movementAttempts >= 3) { reject(candidatePosition, '本次采集的接近尝试预算已用完。'); continue; }
+      check(signal); state.movementAttempts++; details.movementAttempts = state.movementAttempts;
       // Let the body choose feet positions and the route. Adjacent cardinal
       // cells are not an exhaustive set of places from which a block is usable.
       // Production approach returns a bounded diagnostic summary, not its route
@@ -188,13 +231,13 @@ async function gather(bot: any, proposal: any, signal: AbortSignal, controls: Su
       if (reachable()) { position = candidatePosition; break; }
       reject(candidatePosition, '接近后目标已改变、被遮挡、成为脚下承重或仍不在实际可挖范围。');
     }
-    if (!position) throw new Error(`本次有限检查的 ${Math.min(8, eligible.length)} 个候选未能采集 ${blockName}；其他位置或路线仍未知。`);
+    if (!position) throw failure('candidates_exhausted', `本次有限检查的 ${Math.min(8, eligible.length)} 个候选未能采集 ${blockName}；其他位置或路线仍未知。`);
     const block = bot.blockAt(position);
-    if (!block || block.name !== blockName || !withinDigReach(bot, block)) throw new Error('靠近后目标已改变、被遮挡或仍不可挖。');
-    if (position.equals(bot.entity.position.floored().offset(0, -1, 0))) throw new Error('不能采集脚下承重方块。');
+    if (!block || block.name !== blockName || !withinDigReach(bot, block)) throw failure('target_changed', '靠近后目标已改变、被遮挡或仍不可挖。');
+    if (position.equals(bot.entity.position.floored().offset(0, -1, 0))) throw failure('target_changed', '不能采集脚下承重方块。');
     // Tool choice is a local mechanic; resource choice and progression stay with the NPC.
     const available = ownItems(bot).filter(candidate => !block.harvestTools || block.harvestTools[candidate.type]);
-    if (block.harvestTools && !available.length) throw new Error('没有能获取该方块掉落物的工具；不要把破坏方块误当采集成功。');
+    if (block.harvestTools && !available.length) throw failure('missing_tool', '没有能获取该方块掉落物的工具；不要把破坏方块误当采集成功。');
     if (typeof block.digTime === 'function') {
       available.sort((a, b) => block.digTime(a.type, false, false, false) - block.digTime(b.type, false, false, false));
       if (available[0] && block.digTime(available[0].type, false, false, false) < block.digTime(bot.heldItem?.type ?? null, false, false, false)) {
@@ -202,8 +245,12 @@ async function gather(bot: any, proposal: any, signal: AbortSignal, controls: Su
       }
     } else if (block.harvestTools && !block.harvestTools[bot.heldItem?.type]) await checked(signal, bot.equip(available[0], 'hand'));
     await checked(signal, bot.lookAt(position.offset(.5, .5, .5), true));
+    const fresh = bot.blockAt(position);
+    if (!fresh || fresh.type !== block.type || !withinDigReach(bot, fresh)
+      || position.equals(bot.entity.position.floored().offset(0, -1, 0)))
+      throw failure('target_changed', '准备挖掘时目标或站位已改变，停止该候选。');
     await checked(signal, bot.dig(block, 'ignore'));
-    if (bot.blockAt(position)?.type === block.type) throw new Error('服务器未确认方块变化。');
+    if (!bot.blockAt(position) || bot.blockAt(position)?.type === block.type) throw failure('server_unconfirmed', '服务器未确认方块变化。');
     details.minedBlocks++; details.positions.push({ ...position });
     // Drops are never invented from the block type: approach only actual nearby item entities.
     await delay(150, undefined, { signal });
@@ -221,7 +268,7 @@ async function gather(bot: any, proposal: any, signal: AbortSignal, controls: Su
       const horizontal = Math.hypot(current.position.x - bot.entity.position.x, current.position.z - bot.entity.position.z);
       if (horizontal > 1.25) {
         const landing = pickupLanding(bot, current.position);
-        if (landing) {
+        if (landing && landing.distanceTo(origin) <= proposal.maxDistance) {
           try { await controls.moveTo(bot, landing, signal, .8); }
           catch (error: any) {
             check(signal);
@@ -248,20 +295,29 @@ async function syncCraftInventory(bot: any, signal: AbortSignal, details: any, p
 }
 
 async function craft(bot: any, proposal: any, signal: AbortSignal, details: any) {
-  const output = knownItem(bot, proposal.item), table = proposal.table ? blockAtReach(bot, proposal.table, ['crafting_table']) : null;
+  const output = knownItem(bot, proposal.item);
+  let table: any = null;
+  if (proposal.table) {
+    try { table = blockAtReach(bot, proposal.table, ['crafting_table']); }
+    catch (error: any) { throw failure('missing_prerequisites', error.message, { prerequisite: 'reachable_crafting_table' }); }
+  }
   details.requested = proposal.count; details.item = output.name; details.crafts = 0;
   const beforeCount = counts(bot).get(output.name) || 0;
   while ((counts(bot).get(output.name) || 0) - beforeCount < proposal.count) {
     check(signal);
     const recipes = bot.recipesFor(output.id, null, 1, table);
-    if (!recipes.length) throw new Error('当前材料或工作台不足；先调用 recipes 查看要求。');
+    if (!recipes.length) {
+      details.prerequisites = craftPrerequisites(bot, output, table);
+      throw failure('missing_prerequisites', '当前材料或工作台不足；根据回执中的配方要求补足条件，再重新规划。',
+        { prerequisite: 'materials_or_crafting_table' });
+    }
     const recipe = recipes[0], beforeInventory = counts(bot), before = beforeInventory.get(output.name) || 0;
     // One recipe batch at a time lets cancellation stop before starting the next batch.
     details.inventoryConfirmed = false; details.inventorySyncPhase = 'crafting';
     await checked(signal, bot.craft(recipe, 1, table));
     await syncCraftInventory(bot, signal, details, 'batch');
     const added = (counts(bot).get(output.name) || 0) - before;
-    if (added <= 0) throw new Error('合成调用结束，但没有观察到目标物品增加。');
+    if (added <= 0) throw failure('server_unconfirmed', '合成调用结束，但没有观察到目标物品增加。');
     {
       const window = details.craftingWindow;
       if (window.cursor || window.inputs.some((entry: any) => entry.stack)) throw new Error('服务器合成格或光标仍有物品，停止后续批次；这些物品不应记为消耗或丢失。');
@@ -394,7 +450,11 @@ export async function runSurvivalAction(bot: any, proposal: any, signal: AbortSi
     if (error.inventoryUnconfirmed || error.details?.inventoryConfirmed === false) details.inventoryConfirmed = false;
     details.inventoryDelta = delta(before, bot);
     details.partial = details.inventoryDelta.length > 0 || details.minedBlocks > 0;
-    details.stoppedReason = error.message;
+    // Preserve machine-readable causes through partial-result accounting. The
+    // localized message remains diagnostic text rather than a retry classifier.
+    if (error.details?.prerequisite) details.prerequisite = error.details.prerequisite;
+    details.stoppedReason = signal.aborted ? 'cancelled' : error.details?.stoppedReason ?? error.message;
+    details.reason = error.message;
     if (details.inventoryConfirmed === false) {
       details.partial = (details.crafts || 0) > 0;
       details.unconfirmedInventoryDelta = details.inventoryDelta;
