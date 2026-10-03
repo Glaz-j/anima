@@ -95,7 +95,11 @@ export function closestPoint(bot: any, entity: any) {
 }
 
 export function clearLine(bot: any, point: Vec3) {
-  const origin = eye(bot), ray = point.minus(origin), distance = ray.norm();
+  return clearLineFrom(bot, point, eye(bot));
+}
+
+function clearLineFrom(bot: any, point: Vec3, origin: Vec3) {
+  const ray = point.minus(origin), distance = ray.norm();
   return distance < .01 || !bot.world.raycast(origin, ray.scaled(1 / distance), Math.max(0, distance - .05));
 }
 
@@ -536,7 +540,7 @@ export async function runNativeAction(bot: any, proposal: any, signal: AbortSign
     }
     if (proposal.type === 'place') {
       if (typeof bot._placeBlockWithOptions !== 'function') throw new Error('当前 Mineflayer 不支持可取消转向后的原生放置入口，无法安全发送放置动作。');
-      const cell = target.floored();
+      const cell = target.floored(), placementEntity = bot.entity;
       if (!['air', 'cave_air', 'void_air'].includes(bot.blockAt(cell)?.name || '')) throw new Error('目标格不是空位。');
       const item = inventoryItem(bot, proposal.item);
       const expectedItem = { name: item.name, type: item.type };
@@ -549,6 +553,7 @@ export async function runNativeAction(bot: any, proposal: any, signal: AbortSign
       const facePoint = reference.position.offset(.5, .5, .5).plus(face.scaled(.5));
       const validatePlacement = () => {
         checkSignal(signal);
+        if (bot.entity !== placementEntity) throw new Error('等待期间角色实体发生变化，未发送放置。');
         if (!['air', 'cave_air', 'void_air'].includes(bot.blockAt(cell)?.name || '')) throw new Error('等待期间目标格已不再是空位。');
         const currentReference = bot.blockAt(cell.minus(face));
         if (currentReference?.boundingBox !== 'block' || currentReference.name !== referenceState.name ||
@@ -556,6 +561,11 @@ export async function runNativeAction(bot: any, proposal: any, signal: AbortSign
         requireOwnBodyClear(bot, cell, expectedItem.name);
         if (bot.heldItem?.name !== expectedItem.name || bot.heldItem?.type !== expectedItem.type || !(bot.heldItem?.count > 0)) throw new Error('等待期间手持物品发生变化，未发送放置。');
         if (facePoint.distanceTo(eye(bot)) > 4.5 || !clearLine(bot, facePoint)) throw new Error('放置附着面被遮挡或超出眼位 4.5 格范围。');
+        // The pinned 1.21.4 client receives crouching pose metadata later. Check
+        // the lower eye as well without modifying Mineflayer's entity state.
+        const crouchingEye = bot.entity.position.offset(0, Math.min(bot.entity.eyeHeight || 1.62, 1.27), 0);
+        if (facePoint.distanceTo(crouchingEye) > 4.5 || !clearLineFrom(bot, facePoint, crouchingEye))
+          throw new Error('潜行放置附着面被遮挡或超出眼位 4.5 格范围。');
         return currentReference;
       };
       await checked(signal, bot.equip(item, 'hand'));
@@ -564,10 +574,23 @@ export async function runNativeAction(bot: any, proposal: any, signal: AbortSign
       // Aim under our cancellation gate, then skip that internal async boundary.
       await checked(signal, bot.lookAt(facePoint, true));
       const currentReference = validatePlacement();
-      await checked(signal, bot._placeBlockWithOptions(currentReference, face, { forceLook: 'ignore', swingArm: 'right' }));
-      const placed = bot.blockAt(cell);
-      if (!matchesPlacedItem(bot, expectedItem, placed, face)) throw new Error('世界尚未确认放置结果。');
-      return { placementConfirmed: true, placedBlock: { name: placed.name, position: { ...cell } } };
+      const previousSneak = bot.getControlState?.('sneak') === true;
+      const releaseSneak = () => { try { bot.setControlState('sneak', false); } catch { /* Disconnected client. */ } };
+      signal.addEventListener('abort', releaseSneak, { once: true });
+      try {
+        // Place attaches a block; interacting with its support is a separate action.
+        // Keep the posture through the native acknowledgement, even on failure.
+        bot.setControlState('sneak', true);
+        checkSignal(signal);
+        await checked(signal, bot._placeBlockWithOptions(currentReference, face, { forceLook: 'ignore', swingArm: 'right' }));
+        const placed = bot.blockAt(cell);
+        if (!matchesPlacedItem(bot, expectedItem, placed, face)) throw new Error('世界尚未确认放置结果。');
+        return { placementConfirmed: true, placedBlock: { name: placed.name, position: { ...cell } } };
+      } finally {
+        signal.removeEventListener('abort', releaseSneak);
+        const restore = previousSneak && !signal.aborted && bot.entity === placementEntity && bot._client?.state === 'play';
+        try { bot.setControlState('sneak', restore); } catch { /* Preserve the placement error after disconnect. */ }
+      }
     }
     if (proposal.type === 'interact') {
       const cell = target.floored(), block = bot.blockAt(cell);

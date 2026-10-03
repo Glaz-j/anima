@@ -197,6 +197,7 @@ test('the real adapter marks inventory synchronized only after a full player pac
   const f = await fixture(t);
   const bot: any = new EventEmitter();
   bot._client = new EventEmitter();
+  bot.loadPlugin = (plugin: (bot: any) => void) => plugin(bot);
   bot.inventory = { slots: Array(46).fill(null) };
   bot.entity = { position: new Vec3(0, 64, 0) }; bot.game = { dimension: 'overworld' };
   t.mock.method(mineflayer, 'createBot', () => bot);

@@ -10,6 +10,7 @@ import { blockProperties } from './block-observation.ts';
 import { inventorySessionUsable } from './craft-sync.ts';
 import { bodyEnvironment, trackBodyEnvironment } from './body-observation.ts';
 import { IdleWaterPosture } from './idle-water-posture.ts';
+import { installSneakProtocolCompat } from './sneak-compat.ts';
 import { MinecraftBody, NON_BODY_ACTIONS, validateBodyAction, bodyActionTimeoutMs } from './minecraft-body.ts';
 import { runContinuousSkill } from './continuous-skills.ts';
 import { NPC_COMMUNICATION, parseChatChannel } from './communication.ts';
@@ -54,6 +55,7 @@ export class MinecraftWorld {
     if (this.bots.has(name)) throw new ApiError(409, '角色名已经存在。');
     if (this.bots.size >= 4) throw new ApiError(409, '第一版最多同时运行4个角色。');
     const bot = mineflayer.createBot({ host: this.host, port: this.port, version: this.version, username: name, auth: 'offline', hideErrors: true });
+    bot.loadPlugin(installSneakProtocolCompat);
     trackBodyEnvironment(bot);
     const record: BotRecord = { name, persona, roleId, bot, ready: false, inventorySynced: false, events: [], waterPosture: new IdleWaterPosture(bot) };
     this.bots.set(name, record);

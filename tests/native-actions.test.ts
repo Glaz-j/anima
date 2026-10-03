@@ -22,6 +22,8 @@ import { entityHealth, entityVisible, meleeTarget, nativeWalkTo, runNativeAction
 function fakeBot() {
   const bot: any = new EventEmitter();
   bot._client = new EventEmitter();
+  bot._client.state = 'play';
+  bot.loadPlugin = (plugin: (bot: any) => void) => plugin(bot);
   bot._client.write = (name: string) => {
     if (name === 'client_command') queueMicrotask(() => bot._client.emit('statistics', { entries: [] }));
   };
@@ -32,6 +34,7 @@ function fakeBot() {
   bot.world = { raycast: () => null }; bot.controls = {}; bot.attacks = [];
   bot.inventory = { slots: [], items: () => [{ name: 'stone', count: 64 }, { name: 'bow', count: 1 }, { name: 'arrow', count: 64 }] };
   bot.setControlState = (key: string, value: boolean) => { bot.controls[key] = value; };
+  bot.getControlState = (key: string) => bot.controls[key] === true;
   bot.clearControlStates = () => { bot.controls = {}; };
   bot.stopDigging = () => {}; bot.lookAt = async () => {}; bot.quit = () => {};
   bot.findBlocks = () => []; bot.canSeeBlock = () => true;
@@ -51,21 +54,26 @@ async function fixture(bot = fakeBot()) {
   return { bot, record, world };
 }
 
-function nativePlacementFixture(options: { itemName?: string; side?: boolean } = {}) {
+function nativePlacementFixture(options: { itemName?: string; side?: boolean; referenceName?: string } = {}) {
   const bot = fakeBot(), registry = minecraftData('1.21.4'), Block = loadBlock(registry), cell = new Vec3(1, 64, 0);
   const reference = options.side ? cell.offset(1, 0, 0) : cell.offset(0, -1, 0), itemName = options.itemName || 'dirt';
   bot.registry = registry;
-  const item = { name: itemName, type: registry.itemsByName[itemName].id, count: 4 }, packets: any[] = [];
+  const item = { name: itemName, type: registry.itemsByName[itemName].id, count: 4 }, packets: any[] = [], placementSneak: boolean[] = [];
   bot.inventory.items = () => [item]; let targetName: string | null = 'air', targetState: number | undefined;
   bot.blockAt = (point: Vec3) => {
     const position = point.floored();
     if (position.equals(cell) && targetName === null) return null;
-    const name = position.equals(cell) ? targetName! : position.equals(reference) || (!options.side && position.y === 63) ? 'stone' : 'air';
+    const name = position.equals(cell) ? targetName! : position.equals(reference) ? options.referenceName || 'stone'
+      : !options.side && position.y === 63 ? 'stone' : 'air';
     const block = Block.fromStateId(position.equals(cell) && targetState !== undefined ? targetState : registry.blocksByName[name].defaultState, 0);
     block.position = position; return block;
   };
   let sent!: () => void; const packetSent = new Promise<void>(resolve => { sent = resolve; });
-  bot._client.write = (name: string, body: any) => { packets.push({ name, body }); sent(); };
+  bot._client.write = (name: string, body: any) => {
+    packets.push({ name, body });
+    if (name === 'block_place') placementSneak.push(bot.getControlState('sneak'));
+    sent();
+  };
   bot.supportFeature = (name: string) => name === 'blockPlaceHasInsideBlock';
   bot.swingArm = () => {};
   installGenericPlace(bot); installPlaceBlock(bot);
@@ -75,7 +83,7 @@ function nativePlacementFixture(options: { itemName?: string; side?: boolean } =
     bot.emit(`blockUpdate:${reference}`, support, support);
     bot.emit(`blockUpdate:${cell}`, before, bot.blockAt(cell));
   };
-  return { bot, cell, reference, packets, packetSent, acknowledge, setTarget };
+  return { bot, cell, reference, packets, placementSneak, packetSent, acknowledge, setTarget };
 }
 
 function nativeInteractionFixture() {
@@ -533,6 +541,159 @@ test('installed native placement aims once at the attachment face and waits for 
   assert.equal(bot.blockAt(cell).name, 'dirt');
   assert.equal(bot.listenerCount(`blockUpdate:${cell}`), 0); assert.equal(bot.listenerCount(`blockUpdate:${reference}`), 0);
 });
+
+for (const [referenceName, itemName, previousSneak] of [
+  ['crafting_table', 'torch', false], ['furnace', 'torch', false],
+  ['crafting_table', 'chest', true], ['furnace', 'chest', false],
+] as const) {
+  test(`placement sneak precedes ${itemName} placement on ${referenceName} and restores ${previousSneak} after acknowledgement`, async () => {
+    const f = nativePlacementFixture({ referenceName, itemName });
+    f.bot.setControlState('sneak', previousSneak);
+    const pending = runNativeAction(f.bot, { type: 'place', ...f.cell, item: itemName }, new AbortController().signal);
+    await f.packetSent; await delay(0);
+    const heldUntilAcknowledgement = f.bot.getControlState('sneak');
+    f.acknowledge(); const result = await pending;
+    assert.deepEqual(f.placementSneak, [true], 'Interactive support must receive placement with sneak already active.');
+    assert.equal(heldUntilAcknowledgement, true);
+    assert.equal(f.bot.getControlState('sneak'), previousSneak);
+    assert.equal(result.placementConfirmed, true);
+  });
+}
+
+for (const previousSneak of [false, true]) {
+  test(`placement sneak restores ${previousSneak} after a real unchanged-air refusal`, async () => {
+    const f = nativePlacementFixture({ referenceName: 'furnace', itemName: 'chest' });
+    f.bot.setControlState('sneak', previousSneak);
+    const pending = runNativeAction(f.bot, { type: 'place', ...f.cell, item: 'chest' }, new AbortController().signal);
+    const rejected = assert.rejects(pending, /Server refused to place chest/);
+    await f.packetSent; await delay(0); f.acknowledge('air'); await rejected;
+    assert.deepEqual(f.placementSneak, [true]);
+    assert.equal(f.bot.getControlState('sneak'), previousSneak);
+    assert.equal(f.bot.listenerCount(`blockUpdate:${f.cell}`), 0);
+  });
+
+  test(`placement sneak cancellation drains acknowledgement and never restores previous ${previousSneak}`, async () => {
+    const f = nativePlacementFixture({ referenceName: 'crafting_table', itemName: 'torch' });
+    f.bot.setControlState('sneak', previousSneak);
+    const controls: { key: string; value: boolean }[] = [], setControlState = f.bot.setControlState;
+    f.bot.setControlState = (key: string, value: boolean) => { controls.push({ key, value }); setControlState(key, value); };
+    const { world, record } = await fixture(f.bot); let settled = false;
+    const pending = world.execute('Tester', { type: 'place', ...f.cell, item: 'torch' })
+      .then(result => { settled = true; return result; });
+    await f.packetSent; await delay(0); world.stop(record); await delay(0);
+    const stoppedAt = controls.length;
+    assert.equal(f.bot.getControlState('sneak'), false);
+    assert.equal(settled, false); assert.equal(world.summary(record).busy, true);
+    await assert.rejects(world.execute('Tester', { type: 'say', message: 'overlap' }), /正在执行/);
+    f.acknowledge(); const result = await pending;
+    assert.deepEqual(f.placementSneak, [true]);
+    assert.equal(result.status, 'cancelled'); assert.equal(world.summary(record).busy, false);
+    assert.equal(f.bot.getControlState('sneak'), false, 'A stopped action must not re-enable a prior sneak input.');
+    assert.equal(controls.slice(stoppedAt).some(control => control.key === 'sneak' && control.value), false,
+      'Restoration must not briefly re-enable sneak before the world finally clears controls.');
+    assert.equal(f.packets.length, 1);
+    assert.equal(f.bot.listenerCount(`blockUpdate:${f.cell}`), 0);
+    assert.equal(f.bot.listenerCount(`blockUpdate:${f.reference}`), 0);
+  });
+}
+
+test('placement sneak starts only after cancellable aim and final local placement validation', async () => {
+  for (const changed of ['cancel', 'reach', 'visibility', 'target', 'support', 'body', 'hand']) {
+    const itemName = changed === 'body' ? 'dirt' : 'chest';
+    const f = nativePlacementFixture({ referenceName: 'furnace', itemName });
+    const controller = new AbortController(), original = f.bot.blockAt, controls: unknown[] = [];
+    const setControlState = f.bot.setControlState;
+    f.bot.setControlState = (key: string, value: boolean) => { controls.push({ key, value }); setControlState(key, value); };
+    f.bot.lookAt = async () => {
+      if (changed === 'cancel') controller.abort();
+      if (changed === 'reach') f.bot.entity.position = new Vec3(30, 64, 0);
+      if (changed === 'visibility') f.bot.world.raycast = () => ({ name: 'stone' });
+      if (changed === 'target') f.setTarget('stone');
+      if (changed === 'support') f.bot.blockAt = (p: Vec3) => p.equals(f.reference) ? { ...original(p), name: 'air', boundingBox: 'empty' } : original(p);
+      if (changed === 'body') f.bot.entity.position = f.cell.offset(.5, 0, .5);
+      if (changed === 'hand') f.bot.heldItem = { name: 'stone', type: 1, count: 1 };
+    };
+    await assert.rejects(runNativeAction(f.bot, { type: 'place', ...f.cell, item: itemName }, controller.signal),
+      changed === 'cancel' ? /取消/ : changed === 'body' ? /自身身体重叠/ : ['reach', 'visibility'].includes(changed) ? /4\.5/ : /等待期间/);
+    assert.deepEqual(f.packets, [], changed);
+    assert.deepEqual(controls, [], 'Invalid placement must not acquire a sneak input.');
+  }
+});
+
+for (const changed of ['entity', 'closed client']) {
+  test(`placement sneak boundary never restores old true after ${changed} changes without abort`, async () => {
+    const f = nativePlacementFixture({ referenceName: 'furnace', itemName: 'torch' }), controller = new AbortController();
+    f.bot.setControlState('sneak', true);
+    const controls: boolean[] = [], setControlState = f.bot.setControlState;
+    f.bot.setControlState = (key: string, value: boolean) => {
+      if (key === 'sneak') controls.push(value);
+      setControlState(key, value);
+    };
+    const pending = runNativeAction(f.bot, { type: 'place', ...f.cell, item: 'torch' }, controller.signal);
+    await f.packetSent; await delay(0); const changedAt = controls.length;
+    if (changed === 'entity') f.bot.entity = { ...f.bot.entity, id: 2 };
+    else f.bot._client.state = 'closed';
+    f.acknowledge(); await pending;
+    assert.equal(controller.signal.aborted, false);
+    assert.equal(controls.slice(changedAt).includes(true), false);
+    assert.equal(f.bot.getControlState('sneak'), false);
+  });
+}
+
+test('placement sneak boundary direct abort releases input synchronously while draining the native acknowledgement', async () => {
+  const f = nativePlacementFixture({ referenceName: 'crafting_table', itemName: 'torch' }), controller = new AbortController();
+  f.bot.setControlState('sneak', true); let settled = false;
+  const pending = runNativeAction(f.bot, { type: 'place', ...f.cell, item: 'torch' }, controller.signal)
+    .finally(() => { settled = true; });
+  const rejected = assert.rejects(pending, /取消/);
+  await f.packetSent; await delay(0); controller.abort();
+  const sneakAfterAbort = f.bot.getControlState('sneak');
+  await delay(0); const settledBeforeAcknowledgement = settled;
+  f.acknowledge(); await rejected;
+  assert.equal(sneakAfterAbort, false, 'Direct callers also need synchronous release, without world.stop.');
+  assert.equal(settledBeforeAcknowledgement, false);
+  assert.equal(f.bot.getControlState('sneak'), false);
+  assert.equal(f.packets.length, 1);
+  assert.equal(f.bot.listenerCount(`blockUpdate:${f.cell}`), 0);
+});
+
+test('placement sneak boundary cleanup exceptions preserve the original server refusal', async () => {
+  const f = nativePlacementFixture({ referenceName: 'furnace', itemName: 'chest' });
+  const setControlState = f.bot.setControlState; let cleanupAttempts = 0;
+  f.bot.setControlState = (key: string, value: boolean) => {
+    if (key === 'sneak' && !value) { cleanupAttempts++; throw new Error('control cleanup unavailable'); }
+    setControlState(key, value);
+  };
+  const pending = runNativeAction(f.bot, { type: 'place', ...f.cell, item: 'chest' }, new AbortController().signal);
+  const rejected = assert.rejects(pending, /Server refused to place chest/);
+  await f.packetSent; await delay(0); f.acknowledge('air'); await rejected;
+  assert.equal(cleanupAttempts, 1, 'Exercise the failing cleanup call without hiding the placement failure.');
+  assert.equal(f.bot.listenerCount(`blockUpdate:${f.cell}`), 0);
+});
+
+for (const changed of ['occluded', 'out of reach']) {
+  test(`placement sneak boundary rejects a ${changed} crouching eye with zero packets and inputs`, async () => {
+    const f = nativePlacementFixture({ referenceName: 'furnace', itemName: 'torch' });
+    if (changed === 'out of reach') f.bot.entity.position = new Vec3(-2.95, 62, .5);
+    const entity = f.bot.entity, eyeHeight = entity.eyeHeight, position = entity.position.clone();
+    const standingEye = position.offset(0, eyeHeight, 0), crouchingEye = position.offset(0, 1.27, 0);
+    const facePoint = f.reference.offset(.5, 1, .5), controls: unknown[] = [], setControlState = f.bot.setControlState;
+    assert.ok(f.cell.distanceTo(position) < 4.5);
+    assert.ok(facePoint.distanceTo(standingEye) < 4.5);
+    if (changed === 'out of reach') assert.ok(facePoint.distanceTo(crouchingEye) > 4.5);
+    f.bot.setControlState = (key: string, value: boolean) => { controls.push({ key, value }); setControlState(key, value); };
+    f.bot.world.raycast = (origin: Vec3) => {
+      assert.equal(f.bot.entity, entity); assert.equal(f.bot.entity.eyeHeight, eyeHeight);
+      return changed === 'occluded' && origin.y < standingEye.y - .1 ? { name: 'stone' } : null;
+    };
+    // Drain an unexpected packet on the old implementation so failure stays local and quick.
+    void f.packetSent.then(() => delay(0)).then(() => f.acknowledge());
+    await assert.rejects(runNativeAction(f.bot, { type: 'place', ...f.cell, item: 'torch' }, new AbortController().signal), /4\.5|遮挡/);
+    assert.deepEqual(f.packets, []); assert.deepEqual(controls, []);
+    assert.equal(f.bot.entity, entity); assert.equal(f.bot.entity.eyeHeight, eyeHeight);
+    assert.deepEqual(f.bot.entity.position, position);
+  });
+}
 
 test('installed native placement confirms registry-backed standing and wall torch variants at the requested cell', async () => {
   for (const [itemName, wallName] of [['torch', 'wall_torch'], ['soul_torch', 'soul_wall_torch'], ['redstone_torch', 'redstone_wall_torch']]) {
