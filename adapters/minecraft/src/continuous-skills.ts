@@ -199,8 +199,20 @@ async function surface(bot: any, action: any, signal: AbortSignal, elapsed: () =
   if (target && !surfaceTargetAvailable(bot, target))
     throw failure('shore_unavailable', '岸点必须是12格内已加载且可站立的真实平台。');
   const details: any = { controlTicks: 0, shoreReached: false, dryGround: false, breathingConfirmed: false };
+  const refreshAir = () => {
+    if (target) return;
+    let air = false;
+    try {
+      const current = bot.entity.position, head = block(bot, current.offset(0, 1, 0));
+      details.position = { ...current };
+      air = !!(bot.entity.isInWater === true && !bot.entity.isInLava && head
+        && (water(block(bot, current.offset(0, .4, 0))) || water(head)) && passable(block(bot, eyes(bot))));
+    } catch { /* An unavailable body or cell cannot confirm current surface air. */ }
+    details.surfaceReached = air; details.airSpaceObserved = air;
+  };
   try { while (!elapsed()) {
     checkSignal(signal); details.controlTicks++;
+    if (!target) { details.surfaceReached = false; details.airSpaceObserved = false; }
     const current = bot.entity.position, wet = bot.entity.isInWater === true && (water(block(bot, current.offset(0, .4, 0))) || water(block(bot, current.offset(0, 1, 0))));
     details.position = { ...current };
     if (bot.entity.isInLava) throw failure('lava', '当前不是可执行浮水的水体。', details);
@@ -229,7 +241,11 @@ async function surface(bot: any, action: any, signal: AbortSignal, elapsed: () =
     }
     if (!block(bot, current.offset(0, 1, 0))) throw failure('unknown_water', '头部水域尚未加载。', details);
     if (!target && passable(block(bot, eyes(bot)))) {
-      details.surfaceReached = true; details.airSpaceObserved = true; details.stoppedReason = 'surface_air'; return details;
+      // Air geometry does not confirm oxygen recovery. Keep this bounded owner
+      // alive and recheck submersion instead of completing every control tick.
+      details.surfaceReached = true; details.airSpaceObserved = true;
+      bot.setControlState('jump', false); bot.setControlState('forward', false); bot.jumpQueued = false;
+      await tick(signal); continue;
     }
     bot.setControlState('jump', true);
     if (target && horizontal(current, target) > .3) {
@@ -254,8 +270,8 @@ async function surface(bot: any, action: any, signal: AbortSignal, elapsed: () =
     } else bot.setControlState('forward', false);
     await tick(signal);
   }
-  details.stoppedReason = 'duration_elapsed'; return details;
-  } catch (error: any) { error.details = { ...details, ...error.details }; throw error; }
+  refreshAir(); details.stoppedReason = 'duration_elapsed'; return details;
+  } catch (error: any) { refreshAir(); error.details = { ...details, ...error.details }; throw error; }
 }
 
 type JumpInput = { forward: boolean; back: boolean; sprint: boolean; jump: boolean };

@@ -140,6 +140,84 @@ test('surface uses real water contact and distinguishes surface air from confirm
   assert.equal(bot.health, 20); assert.equal(bot.jumpQueued, false);
 });
 
+test('surface holds one bounded slice while local air is observed instead of immediately completing', async t => {
+  const { bot, registry, Block } = fixture(); bot.entity.isInWater = true; bot.entity.onGround = false;
+  bot.blockAt = (p: Vec3) => { const b = Block.fromStateId(registry.blocksByName[p.y < 65 ? 'water' : 'air'].defaultState, 0); b.position = p.floored(); return b; };
+  bot.controls.jump = true; bot.controls.forward = true; bot.jumpQueued = true;
+  let settled = false;
+  const pending = runContinuousSkill(bot, { type: 'surface', durationMs: 250 }, signal());
+  void pending.then(() => { settled = true; });
+  for (let i = 0; i < 8; i++) await Promise.resolve();
+  assert.equal(settled, false); assert.equal(bot.controls.jump, false); assert.equal(bot.controls.forward, false);
+  assert.equal(bot.jumpQueued, false);
+  await delay(110);
+  assert.equal(settled, false, 'Air geometry must not release the body owner between ticks.');
+  const result = await pending;
+  assert.equal(result.stoppedReason, 'duration_elapsed'); assert.ok(result.controlTicks >= 3);
+  assert.equal(result.surfaceReached, true); assert.equal(result.airSpaceObserved, true);
+  assert.equal(result.breathingConfirmed, false); assert.equal(result.shoreReached, false);
+  assert.deepEqual(bot.controls, {}); assert.equal(bot.jumpQueued, false);
+});
+
+test('a held surface slice resumes ascent on the next 50ms check after renewed submersion', async t => {
+  const { bot, registry, Block } = fixture(); bot.entity.isInWater = true; bot.entity.onGround = false;
+  let submerged = false;
+  bot.blockAt = (p: Vec3) => { const b = Block.fromStateId(registry.blocksByName[submerged || p.y < 65 ? 'water' : 'air'].defaultState, 0); b.position = p.floored(); return b; };
+  let upwardAt = 0; const write = bot.setControlState;
+  bot.setControlState = (key: string, value: boolean) => {
+    if (key === 'jump' && value && !upwardAt) upwardAt = performance.now();
+    write(key, value);
+  };
+  const pending = runContinuousSkill(bot, { type: 'surface', durationMs: 175 }, signal()), submergedAt = performance.now();
+  submerged = true;
+  assert.notEqual(bot.controls.jump, true);
+  const result = await pending;
+  assert.ok(upwardAt > submergedAt && upwardAt - submergedAt < 100, 'The next nominal 50ms check resumes input; allow one tick of host timer jitter.');
+  assert.equal(result.surfaceReached, false); assert.equal(result.airSpaceObserved, false);
+  assert.equal(result.breathingConfirmed, false); assert.equal(result.shoreReached, false);
+  assert.equal(result.stoppedReason, 'duration_elapsed'); assert.deepEqual(bot.controls, {});
+});
+
+test('surface deadline does not retain an air observation from before the final submersion', async t => {
+  const { bot, registry, Block } = fixture(); bot.entity.isInWater = true; bot.entity.onGround = false;
+  let submerged = false;
+  bot.blockAt = (p: Vec3) => { const b = Block.fromStateId(registry.blocksByName[submerged || p.y < 65 ? 'water' : 'air'].defaultState, 0); b.position = p.floored(); return b; };
+  const pending = runContinuousSkill(bot, { type: 'surface', durationMs: 125 }, signal());
+  const submerge = setTimeout(() => { submerged = true; }, 110); t.after(() => clearTimeout(submerge));
+  const result = await pending;
+  assert.equal(result.stoppedReason, 'duration_elapsed'); assert.equal(result.surfaceReached, false);
+  assert.equal(result.airSpaceObserved, false); assert.equal(result.breathingConfirmed, false);
+  assert.deepEqual(bot.controls, {}); assert.equal(bot.jumpQueued, false);
+});
+
+for (const end of ['cancel', 'death', 'dry_ground'] as const)
+test(`held surface ends on ${end} and clears all inputs`, async t => {
+  const { bot, registry, Block } = fixture(), controller = new AbortController();
+  bot.entity.isInWater = true; bot.entity.onGround = false;
+  let dry = false;
+  bot.blockAt = (p: Vec3) => {
+    const name = dry ? p.y < 64 ? 'stone' : 'air' : p.y < 65 ? 'water' : 'air';
+    const b = Block.fromStateId(registry.blocksByName[name].defaultState, 0); b.position = p.floored(); return b;
+  };
+  const pending = runContinuousSkill(bot, { type: 'surface', durationMs: 1000 }, controller.signal);
+  for (let i = 0; i < 8; i++) await Promise.resolve();
+  if (end === 'dry_ground') {
+    dry = true; bot.entity.isInWater = false; bot.entity.onGround = true;
+    const result = await pending;
+    assert.equal(result.stoppedReason, 'dry_ground'); assert.equal(result.dryGround, true);
+    assert.equal(result.shoreReached, false);
+  } else {
+    const rejected = assert.rejects(pending);
+    if (end === 'cancel') controller.abort(new Error('Planner revoked surface authority.'));
+    else { bot.health = 0; bot.emit('death'); }
+    await rejected;
+  }
+  assert.deepEqual(bot.controls, {}); assert.equal(bot.jumpQueued, false);
+  assert.equal(bot.listenerCount('death'), 0); assert.equal(bot.listenerCount('respawn'), 0);
+  await delay(60);
+  assert.deepEqual(bot.controls, {});
+});
+
 test('surface with a target cannot claim success when its deadline expires underwater', async () => {
   const { bot, registry, Block } = fixture(); bot.entity.isInWater = true; bot.entity.onGround = false;
   bot.blockAt = (p: Vec3) => {
@@ -335,6 +413,29 @@ test('surfacing starts beneath an occluded shore and reaches it through real wat
   assert.equal(upwardWhileHidden, true); assert.equal(result.shoreReached, true); assert.equal(result.dryGround, true);
   assert.equal(bot.entity.onGround, true); assert.equal(bot.entity.isInWater, false);
   assert.ok(Math.abs(bot.entity.position.y - 63) <= .2);
+});
+
+test('a single targetless surface slice keeps checking and correcting water contact with real physics', async t => {
+  const { bot, registry, Block } = fixture();
+  bot.entity.position = new Vec3(.5, 61, .5); bot.entity.isInWater = true; bot.entity.onGround = false;
+  bot.blockAt = (p: Vec3) => {
+    const name = p.y < 60 ? 'stone' : p.y < 63 ? 'water' : 'air';
+    const b = Block.fromStateId(registry.blocksByName[name].defaultState, 0); b.position = p.floored(); return b;
+  };
+  physicsClock(t, bot);
+  let observedAir = false, resumedAscent = false;
+  const write = bot.setControlState;
+  bot.setControlState = (key: string, value: boolean) => {
+    if (key === 'jump' && !value && bot.blockAt(bot.entity.position.offset(0, 1.62, 0)).name === 'air') observedAir = true;
+    if (key === 'jump' && value && observedAir) resumedAscent = true;
+    write(key, value);
+  };
+  const result = await runContinuousSkill(bot, { type: 'surface', durationMs: 3000 }, signal());
+  assert.equal(result.stoppedReason, 'duration_elapsed'); assert.ok(result.controlTicks >= 20);
+  assert.equal(observedAir, true); assert.equal(resumedAscent, true, JSON.stringify({ observedAir, y: bot.entity.position.y, water: bot.entity.isInWater, result }));
+  assert.ok(bot.entity.position.y > 61); assert.equal(result.breathingConfirmed, false);
+  assert.equal(result.shoreReached, false); assert.equal(bot.jumpQueued, false);
+  assert.ok(Object.values(bot.controlState).every(value => !value));
 });
 
 test('surface can see a bank top behind an occluding rim and walks the remaining distance after climbing out', async t => {

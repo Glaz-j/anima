@@ -986,16 +986,149 @@ for (const blockName of ['chest', 'furnace']) test(`${blockName} container withd
   assert.equal(result.transferred, 2); assert.equal(contents, 3); assert.equal(closed, true);
 });
 
+function furnacePropertyFixture() {
+  const { bot, bag, block, definitions, run } = fixture(); block('furnace', new Vec3(1, 64, 0));
+  const furnace: any = Object.assign(new EventEmitter(), { id: 31, type: 'minecraft:furnace',
+    slots: [{ name: 'raw_iron', type: definitions.raw_iron.id, count: 1, slot: 0 }, null, null],
+    items: () => bot.inventory.items(), close: async () => { furnace.emit('close'); bot.currentWindow = null; } });
+  const operations = { put: 0, take: 0 };
+  bot.openBlock = async () => { bot.currentWindow = furnace; return furnace; };
+  bot.transfer = async () => { operations.put++; assert.fail('Queued input with an active burn must not need another fuel insertion.'); };
+  bot.putAway = async (slot: number) => {
+    operations.take++; assert.equal(slot, 2);
+    const output = furnace.slots[slot]; assert.ok(output);
+    bag.set(output.name, (bag.get(output.name) || 0) + output.count); furnace.slots[slot] = null;
+  };
+  createRequire(import.meta.url)('mineflayer/lib/plugins/furnace.js')(bot);
+  const property = (property: number, value: number, windowId = furnace.id) => bot._client.emit('craft_progress_bar', { windowId, property, value });
+  const output = () => { furnace.slots[0] = null; furnace.slots[2] = { name: 'iron_ingot', count: 1, slot: 2 }; };
+  const smelt = (signal?: AbortSignal) => run({ type: 'smelt', position: { x: 1, y: 64, z: 0 }, input: 'raw_iron', fuel: 'coal' }, signal);
+  return { bot, bag, furnace, operations, property, output, smelt };
+}
+
+test('smelt initial properties use actual installed-plugin packet order before deciding that fuel is missing', async () => {
+  const { bot, furnace, operations, property, output, smelt } = furnacePropertyFixture();
+  const timers = [setTimeout(() => property(0, 100), 20), setTimeout(() => property(1, 100), 40),
+    setTimeout(() => property(2, 190), 60), setTimeout(() => property(3, 200), 80), setTimeout(output, 250)];
+  try {
+    const details: any = await smelt();
+    assert.equal(furnace.fuel, 0, 'The installed plugin never recalculates property 0 when property 1 arrives later.');
+    assert.equal(details.collected, 1); assert.equal(details.fuelAdded, 0); assert.equal(details.output, 'iron_ingot');
+    assert.deepEqual(details.inventoryDelta, [{ item: 'iron_ingot', change: 1 }]);
+    assert.deepEqual(operations, { put: 0, take: 1 });
+    assert.equal(bot.currentWindow, null); assert.equal(bot._client.listenerCount('craft_progress_bar'), 0);
+  } finally { for (const timer of timers) clearTimeout(timer); }
+});
+
+test('smelt initial properties stay unknown when one property is missing and fail within a finite sync bound', async () => {
+  const { bot, furnace, operations, property, smelt } = furnacePropertyFixture();
+  const started = Date.now(), timer = setTimeout(() => {
+    property(0, 100); property(1, 100); property(2, 190);
+    property(3, 200, 99); property(3, NaN); // Neither unrelated nor invalid data completes this window.
+  }, 20);
+  try {
+    await assert.rejects(smelt(), (error: any) => {
+      assert.equal(error.details.stoppedReason, 'furnace_sync_timeout');
+      assert.equal(error.details.collected, 0); assert.equal(error.details.remaining.input.item, 'raw_iron');
+      assert.deepEqual(error.details.inventoryDelta, []); return true;
+    });
+    assert.ok(Date.now() - started >= 1800 && Date.now() - started < 4000);
+    assert.deepEqual(operations, { put: 0, take: 0 }); assert.equal(furnace.slots[0].count, 1);
+    assert.equal(bot.currentWindow, null); assert.equal(bot._client.listenerCount('craft_progress_bar'), 0);
+  } finally { clearTimeout(timer); }
+});
+
+test('smelt initial properties received before the installed openFurnace promise resumes are retained', async () => {
+  const { bot, furnace, operations, property, output, smelt } = furnacePropertyFixture();
+  const openBlock = bot.openBlock;
+  bot.openBlock = async (...args: any[]) => {
+    const window = await openBlock(...args);
+    for (const [id, value] of [[0, 100], [1, 100], [2, 190], [3, 200]]) property(id, value);
+    return window;
+  };
+  const timer = setTimeout(output, 60);
+  try {
+    const details: any = await smelt();
+    assert.equal(furnace.fuel, null, 'These initial packets preceded installation of the plugin property listener.');
+    assert.equal(details.collected, 1); assert.equal(details.fuelAdded, 0);
+    assert.deepEqual(operations, { put: 0, take: 1 }); assert.equal(bot.currentWindow, null);
+    assert.equal(bot._client.listenerCount('craft_progress_bar'), 0);
+  } finally { clearTimeout(timer); }
+});
+
+test('smelt initial properties waiting still collects newly confirmed output instead of treating it as preexisting', async () => {
+  const { bot, operations, property, output, smelt } = furnacePropertyFixture();
+  const timers = [setTimeout(() => { property(0, 100); property(1, 100); }, 20), setTimeout(output, 60)];
+  try {
+    const details: any = await smelt();
+    assert.equal(details.collected, 1); assert.equal(details.preexistingOutput, undefined);
+    assert.deepEqual(details.inventoryDelta, [{ item: 'iron_ingot', change: 1 }]);
+    assert.deepEqual(operations, { put: 0, take: 1 }); assert.equal(bot.currentWindow, null);
+    assert.equal(bot._client.listenerCount('craft_progress_bar'), 0);
+  } finally { for (const timer of timers) clearTimeout(timer); }
+});
+
+test('smelt initial properties cancellation closes the window before any later fuel or output operation', async () => {
+  const { bot, bag, operations, property, output, smelt } = furnacePropertyFixture();
+  bag.set('coal', 1);
+  const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 30);
+  try {
+    await assert.rejects(smelt(controller.signal), (error: any) => {
+      assert.equal(error.details.stoppedReason, 'cancelled'); assert.equal(error.details.collected, 0);
+      assert.equal(error.details.remaining.input.item, 'raw_iron'); return true;
+    });
+    for (const [id, value] of [[0, 0], [1, 100], [2, 190], [3, 200]]) property(id, value);
+    output(); await delay(220);
+    assert.deepEqual(operations, { put: 0, take: 0 }); assert.equal(bag.get('coal'), 1); assert.equal(bag.get('iron_ingot'), undefined);
+    assert.equal(bot.currentWindow, null); assert.equal(bot._client.listenerCount('craft_progress_bar'), 0);
+  } finally { clearTimeout(timer); }
+});
+
+test('smelt initial properties window closure prevents later fuel and output operations', async () => {
+  const { bot, bag, furnace, operations, property, output, smelt } = furnacePropertyFixture();
+  bag.set('coal', 1);
+  const timer = setTimeout(() => { furnace.close(); output(); for (const id of [0, 1, 2, 3]) property(id, 0); }, 30);
+  try {
+    await assert.rejects(smelt(), (error: any) => {
+      assert.equal(error.details.stoppedReason, 'furnace_window_closed'); assert.equal(error.details.collected, 0); return true;
+    });
+    assert.deepEqual(operations, { put: 0, take: 0 }); assert.equal(bag.get('coal'), 1); assert.equal(bag.get('iron_ingot'), undefined);
+    assert.equal(bot.currentWindow, null); assert.equal(bot._client.listenerCount('craft_progress_bar'), 0);
+  } finally { clearTimeout(timer); }
+});
+
+test('smelt initial properties distinguish real zero fuel from a nearly complete progress value', async () => {
+  const { bot, operations, property, smelt } = furnacePropertyFixture();
+  let synchronized = false;
+  const timer = setTimeout(() => {
+    for (const [id, value] of [[0, 0], [1, 100], [2, 190], [3, 200]]) property(id, value);
+    synchronized = true;
+  }, 20);
+  try {
+    await assert.rejects(smelt(), (error: any) => {
+      assert.equal(synchronized, true, 'Do not label unknown fuel as confirmed exhaustion.');
+      assert.match(error.message, /coal/); assert.equal(error.details.collected, 0); assert.equal(error.details.fuelAdded, 0);
+      assert.equal(error.details.remaining.input.count, 1); assert.deepEqual(error.details.inventoryDelta, []); return true;
+    });
+    assert.deepEqual(operations, { put: 0, take: 0 });
+    assert.equal(bot.currentWindow, null); assert.equal(bot._client.listenerCount('craft_progress_bar'), 0);
+  } finally { clearTimeout(timer); }
+});
+
 test('smelt tracks actual input/fuel/output instead of assuming a recipe succeeded', async () => {
   const { bot, bag, block, definitions, run } = fixture(); block('furnace', new Vec3(1, 64, 0));
   bag.set('raw_iron', 1); bag.set('coal', 1);
   let input: any = null, output: any = null, closed = false;
-  const furnace = { items: () => bot.inventory.items(), inputItem: () => input, outputItem: () => output, fuelItem: () => null, fuel: 0, progress: 0,
+  const furnace = Object.assign(new EventEmitter(), { id: 1, items: () => bot.inventory.items(), inputItem: () => input, outputItem: () => output, fuelItem: () => null, fuel: 0, progress: 0,
     putInput: async (id: number, _meta: unknown, count: number) => { assert.equal(id, definitions.raw_iron.id); bag.set('raw_iron', 0); input = { name: 'raw_iron', count }; },
     putFuel: async (id: number) => { assert.equal(id, definitions.coal.id); bag.set('coal', 0); input = null; output = { name: 'iron_ingot', count: 1 }; },
     takeOutput: async () => { bag.set('iron_ingot', (bag.get('iron_ingot') || 0) + output.count); output = null; },
-    close: async () => { closed = true; bot.currentWindow = null; } };
-  bot.openFurnace = async () => { bot.currentWindow = furnace; return furnace; };
+    close: async () => { closed = true; furnace.emit('close'); bot.currentWindow = null; } });
+  bot.openFurnace = async () => {
+    bot.currentWindow = furnace;
+    for (const [property, value] of [[0, 0], [1, 0], [2, 0], [3, 200]]) bot._client.emit('craft_progress_bar', { windowId: 1, property, value });
+    return furnace;
+  };
   const result: any = await run({ type: 'smelt', position: { x: 1, y: 64, z: 0 }, input: 'raw_iron', fuel: 'coal' });
   assert.equal(result.collected, 1); assert.equal(result.output, 'iron_ingot'); assert.equal(closed, true);
   assert.ok(result.inventoryDelta.some((entry: any) => entry.item === 'iron_ingot' && entry.change === 1));
@@ -1039,6 +1172,7 @@ for (const operation of ['smelt', 'withdraw']) test(`installed furnace plugin ${
       for (let i = 9; i < 45; i++) menu.updateSlot(i - 6, Item.fromNotch(Item.toNotch(serverInventory.slots[i])));
       bot._client.emit('open_window', { windowId: 1, inventoryType: 'minecraft:furnace', windowTitle: 'furnace' });
       snapshot();
+      for (const [property, value] of [[0, 0], [1, 0], [2, 0], [3, 200]]) bot._client.emit('craft_progress_bar', { windowId: 1, property, value });
     } else if (name === 'window_click') {
       assert.equal(packet.windowId, menu.id);
       if (packet.mode === 5) snapshot();
@@ -1076,11 +1210,15 @@ test('smelt cancellation closes the window and reports materials left in the fur
   const { bot, bag, block, run } = fixture(); block('furnace', new Vec3(1, 64, 0));
   bag.set('raw_iron', 1); bag.set('coal', 1);
   const controller = new AbortController(); let input: any = null, fuel: any = null, closed = false;
-  const furnace = { items: () => bot.inventory.items(), inputItem: () => input, outputItem: () => null, fuelItem: () => fuel, fuel: 0, progress: .2,
+  const furnace = Object.assign(new EventEmitter(), { id: 1, items: () => bot.inventory.items(), inputItem: () => input, outputItem: () => null, fuelItem: () => fuel, fuel: 0, progress: .2,
     putInput: async () => { bag.set('raw_iron', 0); input = { name: 'raw_iron', count: 1 }; },
     putFuel: async () => { bag.set('coal', 0); fuel = { name: 'coal', count: 1 }; controller.abort(); },
-    close: async () => { closed = true; bot.currentWindow = null; } };
-  bot.openFurnace = async () => { bot.currentWindow = furnace; return furnace; };
+    close: async () => { closed = true; furnace.emit('close'); bot.currentWindow = null; } });
+  bot.openFurnace = async () => {
+    bot.currentWindow = furnace;
+    for (const [property, value] of [[0, 0], [1, 0], [2, 40], [3, 200]]) bot._client.emit('craft_progress_bar', { windowId: 1, property, value });
+    return furnace;
+  };
   await assert.rejects(run({ type: 'smelt', position: { x: 1, y: 64, z: 0 }, input: 'raw_iron', fuel: 'coal' }, controller.signal), (error: any) => {
     assert.equal(error.details.remaining.input.item, 'raw_iron'); assert.equal(error.details.collected, 0); return true;
   });

@@ -363,39 +363,69 @@ async function smelt(bot: any, proposal: any, signal: AbortSignal, details: any)
   const input = knownItem(bot, proposal.input), fuel = knownItem(bot, proposal.fuel);
   const block = blockAtReach(bot, proposal.position, ['furnace', 'blast_furnace', 'smoker']);
   details.position = { ...block.position }; details.requested = proposal.count; details.collected = 0; details.fuelAdded = 0;
-  let furnace: any;
+  let furnace: any, propertyWindow: any, closed = false;
+  const properties: Array<number | undefined> = Array(4).fill(undefined);
+  // Mineflayer initializes normalized values to null; property 0 before 1 also
+  // leaves fuel at a false zero. Observe only this open window's raw properties,
+  // including packets delivered before openFurnace's promise resumes.
+  const onProperty = (packet: any) => {
+    const window = bot.currentWindow;
+    if (signal.aborted || closed || !window || packet.windowId !== window.id
+      || (furnace && window !== furnace) || (propertyWindow && window !== propertyWindow)
+      || !Number.isInteger(packet.property) || packet.property < 0 || packet.property > 3
+      || !Number.isInteger(packet.value) || packet.value < 0 || packet.value > 32767) return;
+    propertyWindow = window; properties[packet.property] = packet.value;
+  };
+  const removeProperties = () => bot._client.removeListener('craft_progress_bar', onProperty);
+  const onClose = () => { closed = true; removeProperties(); };
+  const checkWindow = () => {
+    check(signal);
+    if (closed || bot.currentWindow !== furnace) throw failure('furnace_window_closed', '熔炉窗口已关闭或被替换，停止本轮熔炼。');
+  };
   const started = Date.now();
+  bot._client.on('craft_progress_bar', onProperty);
+  signal.addEventListener('abort', removeProperties, { once: true });
   try {
     furnace = await bot.openFurnace(block); check(signal);
+    furnace.once('close', onClose);
+    const syncDeadline = Date.now() + 2000;
+    checkWindow();
     if (furnace.inputItem() && furnace.inputItem().name !== input.name) throw new Error('熔炉输入槽已有其他材料；先用 container 检查或取走。');
     if (furnace.outputItem()) {
       details.preexistingOutput = compact(furnace.outputItem());
-      await checked(signal, furnace.takeOutput());
+      await checked(signal, furnace.takeOutput()); checkWindow();
     }
     const queued = furnace.inputItem()?.count || 0, needed = Math.max(0, proposal.count - queued);
-    if (needed) { const source = item(bot, input.name, needed); await checked(signal, furnace.putInput(source.type, source.metadata, needed)); }
+    if (needed) { const source = item(bot, input.name, needed); await checked(signal, furnace.putInput(source.type, source.metadata, needed)); checkWindow(); }
     details.queuedInput = compact(furnace.inputItem());
     if (!furnace.inputItem() || furnace.inputItem().name !== input.name) throw new Error('熔炉没有确认输入材料。');
     while (details.collected < proposal.count) {
-      check(signal);
+      checkWindow();
       if (Date.now() - started > 40000) throw new Error('本轮熔炼等待已结束，剩余材料保留在熔炉；请稍后观察或继续。');
       const output = furnace.outputItem();
       if (output) {
         const outputName = output.name, before = counts(bot).get(outputName) || 0;
-        await checked(signal, furnace.takeOutput());
+        await checked(signal, furnace.takeOutput()); checkWindow();
         const confirmed = (counts(bot).get(outputName) || 0) - before;
         if (confirmed <= 0) throw new Error('取出熔炼产物后没有确认背包增量。');
         details.collected += confirmed; details.output = outputName;
       }
       if (details.collected >= proposal.count) break;
-      if (!furnace.fuelItem() && !(furnace.fuel > 0)) {
+      if (propertyWindow !== furnace || properties.some(value => value === undefined)) {
+        if (Date.now() >= syncDeadline) throw failure('furnace_sync_timeout', '熔炉初始燃料和进度尚未同步，材料保留在炉内；请稍后观察。');
+        await delay(Math.min(200, syncDeadline - Date.now()), undefined, { signal });
+        continue; // Recheck actual output before trying fuel after a delayed update.
+      }
+      if (!furnace.fuelItem() && properties[0] === 0) {
         const source = item(bot, fuel.name);
-        await checked(signal, furnace.putFuel(source.type, source.metadata, 1)); details.fuelAdded++;
+        await checked(signal, furnace.putFuel(source.type, source.metadata, 1)); checkWindow(); details.fuelAdded++;
       }
       await delay(200, undefined, { signal });
     }
     return details;
   } finally {
+    removeProperties(); signal.removeEventListener('abort', removeProperties);
+    furnace?.removeListener('close', onClose);
     if (furnace) details.remaining = { input: compact(furnace.inputItem()), fuel: compact(furnace.fuelItem()), output: compact(furnace.outputItem()), progress: furnace.progress };
     await closeWindow(bot, furnace);
   }
