@@ -205,6 +205,110 @@ test('a valid shore remains selected and loss of support drains it before vertic
   assert.deepEqual(f.body.snapshot().completedSteps, []);
 });
 
+test('blocked shore work requests replanning despite vertical bobbing and retains incomplete work', async t => {
+  const f = fixture(true); t.after(() => f.clean());
+  const steps = [{ type: 'surface', target: { x: 3, y: 64, z: 0 } }, { type: 'wait', ms: 100 }];
+  await f.submit(steps);
+  f.bot.entity.position.y += .2056237955;
+  await f.finish(0, { stoppedReason: 'shore_route_blocked', shoreReached: false, dryGround: false });
+  assert.equal(f.body.snapshot().replanRequired?.code, 'shore_route_blocked');
+  for (let index = 0; index < 4; index++) await f.tick();
+  assert.equal(f.calls.length, 1, 'Neither bobbing nor backoff permits replaying the rejected shore route.');
+  assert.deepEqual(f.body.snapshot().completedSteps, []);
+  assert.equal(f.body.snapshot().workCompleted, false);
+});
+
+test('blocked shore reaction falls back to real authorized ascent and drains on cancellation', async t => {
+  const f = fixture(true); t.after(() => f.clean());
+  f.bot.entity.isInWater = true; f.bot.entity.onGround = false;
+  const blockAt = f.bot.blockAt;
+  f.bot.blockAt = (p: Vec3) => p.x < 2 ? { name: 'water', boundingBox: 'empty', position: p } : blockAt(p);
+  const target = { x: 3, y: 64, z: 0 };
+  await f.submit([{ type: 'surface', target }], { reactions: ['surface'] });
+  assert.deepEqual(f.calls[0].action.target, target);
+  await f.finish(0, { stoppedReason: 'shore_route_blocked', shoreReached: false });
+  await f.tick();
+  assert.equal(f.calls.length, 2);
+  assert.equal(f.calls[1].action.target, undefined, 'A valid destination cannot revive its failed route in the reflex.');
+  assert.equal(f.body.snapshot().replanRequired?.code, 'shore_route_blocked');
+  const pending = runContinuousSkill(f.bot, f.calls[1].action, f.calls[1].signal);
+  const cancelled = assert.rejects(pending);
+  assert.equal(f.bot.getControlState('jump'), true, 'Fallback must issue real upward input while submerged.');
+  assert.equal(f.body.cancel(f.body.snapshot().version).accepted, true);
+  assert.equal(f.calls[1].signal.aborted, true);
+  assert.equal(f.bot.getControlState('jump'), false);
+  await cancelled; await f.finish(1, {}, 'cancelled'); await f.tick();
+  assert.equal(f.calls.length, 2); assert.deepEqual(f.body.snapshot().completedSteps, []);
+});
+
+test('blocked shore failure after an append still belongs to the current intent lineage', async t => {
+  const f = fixture(true); t.after(() => f.clean()); f.bot.entity.isInWater = true;
+  const target = { x: 3, y: 64, z: 0 };
+  await f.submit([{ type: 'surface', target }], { reactions: ['surface'] });
+  const original = f.body.snapshot(), oldSignal = f.calls[0].signal;
+  assert.equal(f.body.append({ expectedVersion: original.version, steps: [{ type: 'wait', ms: 100 }] }).accepted, true);
+  assert.equal(oldSignal.aborted, false);
+  assert.equal(f.body.snapshot().intent?.id, original.intent?.id);
+  assert.ok(f.body.snapshot().version > original.version);
+  await f.finish(0, { stoppedReason: 'shore_route_blocked', shoreReached: false });
+  await f.tick();
+  assert.equal(f.calls[1].action.target, undefined, 'Appending work does not forgive an in-flight failure from the same intent.');
+  assert.equal(f.body.snapshot().replanRequired?.code, 'shore_route_blocked');
+  assert.deepEqual(f.body.snapshot().completedSteps, []);
+});
+
+test('blocked shore stays rejected across unchanged renewal and a refused append', async t => {
+  const f = fixture(true); t.after(() => f.clean());
+  const steps = [{ type: 'surface', target: { x: 3, y: 64, z: 0 } }], extra = { reactions: ['surface'] };
+  await f.submit(steps, extra);
+  await f.finish(0, { stoppedReason: 'shore_route_blocked', shoreReached: false });
+  assert.equal((await f.submit(steps, extra)).unchanged, true);
+  const appended = f.body.append({ expectedVersion: f.body.snapshot().version, steps: [{ type: 'wait', ms: 100 }] });
+  assert.equal(appended.accepted, false); assert.equal(appended.reason, 'append_unavailable');
+  f.bot.entity.isInWater = true; await f.tick();
+  assert.equal(f.calls[1].action.target, undefined);
+  assert.equal(f.body.snapshot().replanRequired?.code, 'shore_route_blocked');
+  assert.deepEqual(f.body.snapshot().completedSteps, []);
+});
+
+test('blocked shore records cannot be created by an old intent late cancelled failure', async t => {
+  const f = fixture(true); t.after(() => f.clean()); f.bot.entity.isInWater = true;
+  const target = { x: 3, y: 64, z: 0 }, extra = { reactions: ['surface'] };
+  await f.submit([{ type: 'surface', target }], extra);
+  const previousId = f.body.snapshot().intent?.id;
+  await f.submit([{ type: 'surface', target }, { type: 'wait', ms: 100 }], extra);
+  assert.notEqual(f.body.snapshot().intent?.id, previousId);
+  assert.equal(f.calls[0].signal.aborted, true);
+  await f.finish(0, { stoppedReason: 'shore_route_blocked', shoreReached: false }, 'failed');
+  await f.tick();
+  assert.deepEqual(f.calls[1].action.target, target, 'Cancelled old results must not poison an explicitly new authorization.');
+  assert.equal(f.body.snapshot().replanRequired, undefined);
+  const receipt = f.events.filter(event => event.type === 'skill-finished').at(-1)?.controlEvent.receipt;
+  assert.equal(receipt.status, 'cancelled');
+});
+
+test('blocked shore is retried only after an explicitly new intent', async t => {
+  const f = fixture(true); t.after(() => f.clean()); f.bot.entity.isInWater = true;
+  const steps = [{ type: 'surface', target: { x: 3, y: 64, z: 0 } }], extra = { reactions: ['surface'] };
+  await f.submit(steps, extra); const originalId = f.body.snapshot().intent?.id;
+  await f.finish(0, { stoppedReason: 'shore_route_blocked', shoreReached: false });
+  await f.submit(steps, { ...extra, restart: true });
+  await f.tick();
+  assert.notEqual(f.body.snapshot().intent?.id, originalId);
+  assert.deepEqual(f.calls[1].action.target, steps[0].target);
+  assert.equal(f.body.snapshot().replanRequired, undefined);
+});
+
+test('blocked shore work cannot create an unauthorized ascent', async t => {
+  const f = fixture(true); t.after(() => f.clean());
+  await f.submit([{ type: 'surface', target: { x: 3, y: 64, z: 0 } }]);
+  await f.finish(0, { stoppedReason: 'shore_route_blocked', shoreReached: false });
+  f.bot.entity.isInWater = true;
+  for (let index = 0; index < 3; index++) await f.tick();
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.body.snapshot().replanRequired?.code, 'shore_route_blocked');
+});
+
 test('water and an invalid planned shore do not grant an unauthorized surface reaction', async t => {
   const f = fixture(true); t.after(() => f.clean()); f.bot.entity.isInWater = true;
   const steps = [{ type: 'wait', ms: 100 }, { type: 'surface', target: { x: 13, y: 64, z: 0 } }];

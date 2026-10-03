@@ -22,6 +22,7 @@ interface FastState { ready: boolean; health: number; food: number; water: boole
 type SkillRequest = { native: any; step?: number; version: number; reaction?: string };
 type BridgeProgress = { spent: number; inventoryConfirmed: boolean; exhausted: boolean; origin: { x: number; y: number; z: number } };
 type MovementOrigin = MinecraftPlan['anchor'];
+const shoreTargetKey = (target: MovementOrigin) => [target.x, target.y, target.z].join(',');
 const ENCOUNTER_CLEAR_MS = 2000;
 const CONFIRMATION_WAIT_MS = 5000;
 const MAX_UNPRODUCTIVE_ATTEMPTS = 3;
@@ -37,7 +38,8 @@ const REPLAN_CODES = new Set(['jump_arc_blocked', 'jump_out_of_range', 'landing_
   'jump_no_trajectory', 'missed_landing', 'fell_below_target', 'target_blocked', 'no_visible_route',
   'no_path', 'search_budget', 'movement_budget', 'node_budget', 'read_budget', 'planning_budget',
   'step_blocked', 'head_blocked', 'vertical_only', 'hazard', 'hazardous_landing',
-  'unsupported_drop', 'no_progress', 'target_changed', 'target_not_visible', 'target_out_of_range', 'target_occluded']);
+  'unsupported_drop', 'no_progress', 'target_changed', 'target_not_visible', 'target_out_of_range', 'target_occluded',
+  'shore_route_blocked']);
 type ReplanRequired = { intentVersion: number; stepIndex: number; receiptId: number; code: string; reason: string };
 function stoppedCode(details: any): string | undefined {
   // A compound skill may successfully approach before discovering a different
@@ -127,6 +129,7 @@ export class MinecraftBody {
   private planningNotice?: string;
   private planningCheckPending = false;
   private replanRequired?: ReplanRequired;
+  private blockedShoreTargets = new Set<string>();
   private goalStatus: 'idle' | 'working' | 'blocked' | 'watching' | 'completed' | 'cancelled' | 'expired' | 'stopped' = 'idle';
 
   constructor(world: MinecraftWorld, record: BotRecord, emitMetric: (event: any) => void = () => {}) {
@@ -411,7 +414,8 @@ export class MinecraftBody {
       markHazard('water');
       const plannedSurface = intent.goal.steps.find((s: any, i: number) => s.type === 'surface' && !this.completed.has(i));
       const surface = current?.skill.reaction === 'surface' ? current.skill.action.native : plannedSurface;
-      const usable = surface && (!surface.target || surfaceTargetAvailable(this.record.bot, surface.target));
+      const usable = surface && (!surface.target || !this.blockedShoreTargets.has(shoreTargetKey(surface.target))
+        && surfaceTargetAvailable(this.record.bot, surface.target));
       return run(usable ? surface : { type: 'surface', durationMs: surface?.durationMs ?? 8000 }, 100, 'surface');
     }
     const enemy = state.enemies.find(e => e.distance <= p.threatRange);
@@ -511,10 +515,12 @@ export class MinecraftBody {
     const planning = details.travel?.planning;
     const unstartedTravel = receipt.status === 'failed' && result?.action?.type === 'travel'
       && stoppedCode(details) === 'not_grounded' && planning?.plans === 0 && planning.nodes === 0 && planning.legs === 0;
+    const blockedShore = receipt.status === 'failed' && result?.action?.type === 'surface' && !!result.action.target
+      && stoppedCode(details) === 'shore_route_blocked';
     const current = this.record.bot.entity?.position;
-    // Before navigation executes any leg, water buoyancy can change Y while
-    // making no progress toward travel's horizontal goal. Keep the raw receipt.
-    const moved = start?.key === receipt.key && current && (unstartedTravel
+    // Buoyancy does not advance an unstarted horizontal journey or a blocked
+    // route to shore. Untargeted emergency ascent still credits vertical motion.
+    const moved = start?.key === receipt.key && current && (unstartedTravel || blockedShore
       ? Math.hypot(current.x - start.position.x, current.z - start.position.z)
       : current.distanceTo(start.position)) >= .15;
     return !!(moved || details.minedBlocks > 0 || details.spent > 0 || details.inventoryIncreased === true
@@ -546,17 +552,34 @@ export class MinecraftBody {
       this.goalFinished = false;
       this.planningNotice = undefined;
       this.replanRequired = undefined;
+      this.blockedShoreTargets.clear();
       this.goalStatus = this.controller.snapshot().intent?.goal.steps.length ? 'working' : 'watching';
     }
     if (event.type === 'intent-extended') { this.goalFinished = false; this.goalStatus = 'working'; }
     const ended = event.type === 'intent-cancelled' ? 'cancelled' : event.type === 'intent-expired' ? 'expired'
       : event.type === 'control-stopped' ? 'stopped' : undefined;
-    if (ended) { this.goalStatus = ended; this.goalFinished = false; this.replanRequired = undefined; }
+    if (ended) { this.goalStatus = ended; this.goalFinished = false; this.replanRequired = undefined; this.blockedShoreTargets.clear(); }
     if (event.type === 'control-stopped') { this.localThreats.clear(); this.cache = undefined; }
     if (['skill-finished', 'skill-cancelling', 'control-stopped'].includes(event.type)) this.activeReaction = undefined;
     const receipt = event.receipt;
     if (event.type === 'skill-finished' && receipt) {
       const snapshot = this.controller.snapshot(), currentVersion = snapshot.version;
+      const shoreResult: any = receipt.result;
+      if (snapshot.intent && receipt.intentId === snapshot.intent.id && receipt.status === 'failed'
+        && shoreResult?.action?.type === 'surface' && shoreResult.action.target
+        && stoppedCode(shoreResult.details) === 'shore_route_blocked') {
+        // Keep this failed route scoped to the grant, including append/renew.
+        // A late cancelled receipt cannot poison a replacement plan. Retain
+        // authorized vertical ascent while the brain chooses another shore.
+        const key = shoreTargetKey(shoreResult.action.target);
+        this.blockedShoreTargets.add(key);
+        if (receipt.reaction === 'surface') {
+          const index = snapshot.intent.goal.steps.findIndex((step, i) => step.type === 'surface' && step.target
+            && !this.completed.has(i) && shoreTargetKey(step.target) === key);
+          if (index >= 0) this.blockStep(snapshot.intent, index, 'shore_route_blocked', receipt.id,
+            String(shoreResult.error ?? 'shore_route_blocked'));
+        }
+      }
       if (snapshot.intent && receipt.intentId === snapshot.intent.id && !receipt.reaction) {
         const match = /:step-(\d+):/u.exec(receipt.key);
         if (match) {
