@@ -468,6 +468,52 @@ test('mechanism ablation: an exhausted flee authorization cannot spin at the sam
   }
 });
 
+for (const mode of ['work', 'reaction'] as const) test(`blocked retreat ${mode} cannot reset retry limits through vertical bouncing`, async t => {
+  const f = fixture(true); t.after(() => f.clean());
+  f.bot.health = 4;
+  f.bot.entities[9] = { id: 9, name: 'zombie', health: 20, width: .6, height: 1.8, position: new Vec3(2, 64, 0) };
+  const steps = mode === 'work' ? [{ type: 'retreat', entityId: 9, maxDistance: 8 }] : [];
+  const extra = { reactions: mode === 'work' ? ['surface'] : ['flee', 'defend', 'surface'], policy: { retreatHealth: 6, threatRange: 7, chaseRange: 8 } };
+  await f.submit(steps, extra);
+  for (let i = 0; i < 3; i++) {
+    assert.equal(f.calls[i]?.action.type, 'retreat');
+    f.bot.entity.position.y = i % 2 === 0 ? 64.42 : 64;
+    await f.finish(i, { stoppedReason: 'retreat_blocked' }); await f.tick();
+  }
+  if (mode === 'work') {
+    assert.equal(f.body.snapshot().replanRequired?.code, 'repeated_no_progress');
+    assert.deepEqual(f.body.snapshot().completedSteps, []);
+    assert.equal(f.calls.length, 3);
+    assert.equal((await f.submit(steps, extra)).unchanged, true);
+    await f.tick(); assert.equal(f.calls.length, 3);
+  } else {
+    assert.equal(f.body.snapshot().reactionBlocked?.find(r => r.reaction === 'flee')?.code, 'repeated_no_progress');
+    assert.equal(f.calls[3]?.action.type, 'combat', 'Independent authorized defense remains available.');
+    await f.finish(3, { attempts: 1 }, 'completed');
+  }
+  f.bot.entity.isInWater = true; await f.tick();
+  assert.equal(f.calls.at(-1)?.action.type, 'surface', 'Blocking repeated retreat must not revoke independent emergency ascent.');
+});
+
+for (const [label, type, status, code, displacement] of [
+  ['lateral retreat progress', 'retreat', 'failed', 'retreat_blocked', new Vec3(.2, 0, 0)],
+  ['successful vertical retreat', 'retreat', 'completed', 'time_limit', new Vec3(0, .3, 0)],
+  ['another retreat outcome', 'retreat', 'failed', 'time_limit', new Vec3(0, .3, 0)],
+  ['vertical combat movement', 'combat', 'failed', 'retreat_blocked', new Vec3(0, .3, 0)],
+] as const) test(`blocked retreat correction preserves ${label}`, async t => {
+  const f = fixture(true); t.after(() => f.clean());
+  f.bot.health = type === 'retreat' ? 4 : 20;
+  f.bot.entities[9] = { id: 9, name: 'zombie', health: 20, width: .6, height: 1.8, position: new Vec3(2, 64, 0) };
+  await f.submit([], { reactions: type === 'retreat' ? ['flee'] : ['defend'], policy: { retreatHealth: 6, threatRange: 7, chaseRange: 8 } });
+  for (let i = 0; i < 3; i++) {
+    assert.equal(f.calls[i]?.action.type, type);
+    f.bot.entity.position = f.bot.entity.position.plus(displacement);
+    await f.finish(i, { stoppedReason: code }, status); await f.tick();
+  }
+  assert.equal(f.body.snapshot().reactionBlocked?.length ?? 0, 0);
+  assert.equal(f.calls.length, 4);
+});
+
 test('terminal full-task plan suppresses unnecessary top-up but append preserves a running skill', async t => {
   const f = fixture(true); t.after(() => f.clean());
   await f.submit([{ type: 'wait', ms: 1000 }], { terminal: true });

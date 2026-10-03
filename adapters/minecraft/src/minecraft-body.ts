@@ -524,10 +524,13 @@ export class MinecraftBody {
       && stoppedCode(details) === 'not_grounded' && planning?.plans === 0 && planning.nodes === 0 && planning.legs === 0;
     const blockedShore = receipt.status === 'failed' && result?.action?.type === 'surface' && !!result.action.target
       && stoppedCode(details) === 'shore_route_blocked';
+    const blockedRetreat = receipt.status === 'failed' && result?.action?.type === 'retreat'
+      && stoppedCode(details) === 'retreat_blocked';
     const current = this.record.bot.entity?.position;
     // Buoyancy does not advance an unstarted horizontal journey or a blocked
-    // route to shore. Untargeted emergency ascent still credits vertical motion.
-    const moved = start?.key === receipt.key && current && (unstartedTravel || blockedShore
+    // route to shore. Bouncing in a rejected retreat also does not establish
+    // escape progress. Other outcomes and emergency ascent retain vertical credit.
+    const moved = start?.key === receipt.key && current && (unstartedTravel || blockedShore || blockedRetreat
       ? Math.hypot(current.x - start.position.x, current.z - start.position.z)
       : current.distanceTo(start.position)) >= .15;
     return !!(moved || details.minedBlocks > 0 || details.spent > 0 || details.inventoryIncreased === true
