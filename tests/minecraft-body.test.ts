@@ -112,6 +112,18 @@ test('injury meal does not interrupt an authorized nearby fight', async t => {
   assert.equal(f.calls[0].action.type, 'combat');
 });
 
+test('a visible zombie villager triggers authorized defense before its first hit', async t => {
+  const f = fixture(); t.after(() => f.clean()); f.enemy('zombie_villager');
+  await f.submit([], { reactions: ['defend'] });
+  assert.equal(f.calls[0]?.action.type, 'combat'); assert.equal(f.calls[0].action.entityId, 9);
+});
+
+test('a peaceful villager never becomes a preemptive defense target', async t => {
+  const f = fixture(); t.after(() => f.clean()); f.enemy('villager');
+  await f.submit([], { reactions: ['defend', 'flee'] });
+  assert.equal(f.calls.length, 0);
+});
+
 test('a new creeper overrides retained zombie defense and cancellation drains first', async t => {
   let now = Date.now(); t.mock.method(Date, 'now', () => now);
   const f = fixture(); t.after(() => f.clean()); f.enemy();

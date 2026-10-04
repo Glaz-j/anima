@@ -32,6 +32,16 @@ test('manual combat and reflex combat share response semantics, unrelated diggin
   assert.equal(f.events[1].type, 'reaction'); assert.equal(f.events[1].at, 1600);
 });
 
+test('zombie villagers count as hazards while peaceful villagers do not', () => {
+  const f = setup(); f.bot.entity.isInWater = false;
+  f.bot.entities[2] = { id: 2, name: 'villager', health: 20, position: new Vec3(2, 64, 0), height: 1.8, width: .6 };
+  f.observer.update(); assert.equal(f.events.length, 0);
+  f.bot.entities[3] = { ...f.bot.entities[2], id: 3, name: 'zombie_villager' };
+  f.observer.update(); assert.equal(f.events[0]?.type, 'hazard-observed');
+  f.action({ type: 'combat', entityId: 3 }); f.input('use_entity', 'use_entity');
+  assert.equal(f.events[1]?.type, 'reaction');
+});
+
 test('unanswered hazards remain unanswered and brief visibility flicker does not inflate their count', () => {
   const f = setup(); f.observer.update();
   f.bot.entity.isInWater = false; f.time(1400); f.observer.update();

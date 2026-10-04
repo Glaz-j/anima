@@ -3,7 +3,7 @@ import { bodyEnvironment } from '../src/body-observation.ts';
 import { entityHealth, entityVisible } from '../src/native-actions.ts';
 import type { ExamEvent } from './types.ts';
 
-const HOSTILE = new Set(['zombie', 'husk', 'drowned', 'skeleton', 'stray', 'wither_skeleton', 'creeper', 'blaze', 'pillager', 'vindicator', 'witch', 'endermite', 'silverfish']);
+const HOSTILE = new Set(['zombie', 'zombie_villager', 'husk', 'drowned', 'skeleton', 'stray', 'wither_skeleton', 'creeper', 'blaze', 'pillager', 'vindicator', 'witch', 'endermite', 'silverfish']);
 type Hazard = { id: string; lastSeen: number; responded: boolean };
 
 /** A candidate-local, read-only observer with identical semantics in all

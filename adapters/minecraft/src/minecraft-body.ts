@@ -15,7 +15,7 @@ import { createLocalThreats } from './local-threats.ts';
 import type { MinecraftWorld, BotRecord } from './world.ts';
 
 const REACTIONS = ['surface', 'eat', 'defend', 'flee'] as const;
-const HOSTILE = new Set(['zombie', 'husk', 'drowned', 'skeleton', 'stray', 'wither_skeleton', 'creeper', 'blaze', 'pillager', 'vindicator', 'witch', 'endermite', 'silverfish']);
+const HOSTILE = new Set(['zombie', 'zombie_villager', 'husk', 'drowned', 'skeleton', 'stray', 'wither_skeleton', 'creeper', 'blaze', 'pillager', 'vindicator', 'witch', 'endermite', 'silverfish']);
 export const NON_BODY_ACTIONS = new Set(['scan', 'recipes', 'say', 'broadcast']);
 export type BodyPolicy = { retreatHealth: number; eatBelow: number; healBelow: number; threatRange: number; chaseRange: number };
 export interface MinecraftPlan { steps: any[]; policy: BodyPolicy; label: string; anchor: { x: number; y: number; z: number }; terminal: boolean }
