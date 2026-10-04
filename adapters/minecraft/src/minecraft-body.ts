@@ -17,7 +17,7 @@ import type { MinecraftWorld, BotRecord } from './world.ts';
 const REACTIONS = ['surface', 'eat', 'defend', 'flee'] as const;
 const HOSTILE = new Set(['zombie', 'husk', 'drowned', 'skeleton', 'stray', 'wither_skeleton', 'creeper', 'blaze', 'pillager', 'vindicator', 'witch', 'endermite', 'silverfish']);
 export const NON_BODY_ACTIONS = new Set(['scan', 'recipes', 'say', 'broadcast']);
-export type BodyPolicy = { retreatHealth: number; eatBelow: number; threatRange: number; chaseRange: number };
+export type BodyPolicy = { retreatHealth: number; eatBelow: number; healBelow: number; threatRange: number; chaseRange: number };
 export interface MinecraftPlan { steps: any[]; policy: BodyPolicy; label: string; anchor: { x: number; y: number; z: number }; terminal: boolean }
 export interface MinecraftAppend { expectedVersion: number; steps: any[]; ttlMs?: number; terminal?: boolean }
 interface FastState { ready: boolean; health: number; food: number; water: boolean; lava: boolean; oxygen?: number; enemies: any[] }
@@ -86,7 +86,10 @@ export function validateBodyAction(raw: any) {
       const maxRange = type === 'pickup' ? 32 : 24;
       if (!Number.isFinite(maxDistance) || maxDistance < 0 || maxDistance > maxRange)
         throw new ApiError(400, `局部移动范围必须是0–${maxRange}格。`);
+      if (type === 'combat' && raw.stance !== undefined && !['pursue', 'hold'].includes(raw.stance))
+        throw new ApiError(400, '战斗姿态只能是pursue或hold。');
       return { type, entityId: raw.entityId, durationMs, maxDistance,
+        ...(type === 'combat' && raw.stance !== undefined ? { stance: raw.stance } : {}),
         ...(raw.origin ? { origin: coordinates(raw.origin) } : {}) };
     }
     return { type, durationMs, ...(type === 'surface' && raw.target ? { target: coordinates(raw.target) } : {}) };
@@ -219,8 +222,8 @@ export class MinecraftBody {
     if (!Number.isInteger(ttlMs) || ttlMs < 1000 || ttlMs > 300000) throw new ApiError(400, '目标授权时限必须是1–300秒。');
     const reactions = raw.reactions ?? [];
     if (!Array.isArray(reactions) || reactions.some((r: any) => !REACTIONS.includes(r))) throw new ApiError(400, '无效应急授权。');
-    const policy: BodyPolicy = { retreatHealth: 6, eatBelow: 14, threatRange: 7, chaseRange: 12, ...raw.policy };
-    for (const [key, max] of [['retreatHealth', 20], ['eatBelow', 20], ['threatRange', 16], ['chaseRange', 24]] as const) {
+    const policy: BodyPolicy = { retreatHealth: 6, eatBelow: 14, healBelow: 18, threatRange: 7, chaseRange: 12, ...raw.policy };
+    for (const [key, max] of [['retreatHealth', 20], ['eatBelow', 20], ['healBelow', 20], ['threatRange', 16], ['chaseRange', 24]] as const) {
       if (!Number.isFinite(policy[key]) || policy[key] < 0 || policy[key] > max) throw new ApiError(400, `${key}超出允许范围。`);
     }
     const old = snapshot.intent;
@@ -432,7 +435,14 @@ export class MinecraftBody {
         && surfaceTargetAvailable(this.record.bot, surface.target));
       return run(usable ? surface : { type: 'surface', durationMs: surface?.durationMs ?? 8000 }, 100, 'surface');
     }
-    const enemy = state.enemies.find(e => e.distance <= p.threatRange);
+    // Keep a still visible, local defense target instead of cancelling every
+    // time two enemies exchange nearest-distance order. Imminent creepers and
+    // low health still take priority, and unavailable targets are never retained.
+    const defending = current?.skill.reaction === 'defend' ? current.skill.action.native.entityId : undefined;
+    const retained = state.enemies.find(e => e.id === defending && e.distance <= p.threatRange + 2
+      && entityVisible(this.record.bot, this.record.bot.entities[e.id]));
+    const enemy = state.enemies.find(e => e.name === 'creeper' && e.distance <= p.threatRange)
+      ?? retained ?? state.enemies.find(e => e.distance <= p.threatRange);
     if (enemy) {
       this.lastDangerAt = now; markHazard(`enemy:${enemy.id}`);
       const reactionOrigin = () => {
@@ -443,13 +453,15 @@ export class MinecraftBody {
         && !this.encounter?.blocked?.flee)
         return run({ type: 'retreat', entityId: enemy.id, durationMs: 3000, maxDistance: p.chaseRange, origin: reactionOrigin() }, 90, 'flee');
       if (allowed.includes('defend') && !this.encounter?.blocked?.defend)
-        return run({ type: 'combat', entityId: enemy.id, durationMs: 8000, maxDistance: p.chaseRange, origin: reactionOrigin() }, 80, 'defend');
+        return run({ type: 'combat', entityId: enemy.id, durationMs: 8000, maxDistance: p.chaseRange, origin: reactionOrigin(),
+          ...(this.encounter?.blocked?.flee ? { stance: 'hold' } : {}) }, 80, 'defend');
     }
     // Finish an already authorized short reaction to avoid jitter at perception boundaries.
     if (current?.skill.reaction && now - this.lastDangerAt < 500 && ['defend', 'flee'].includes(current.skill.reaction)) return current.skill;
     if (!enemy) this.hazard = undefined;
     const hasFood = inventorySessionUsable(this.record.bot) && findSafeFood(this.record.bot);
-    if (state.food < p.eatBelow && allowed.includes('eat') && hasFood && now >= this.quietUntil)
+    const injuryMeal = !enemy && state.health < p.healBelow && state.food < 20;
+    if ((state.food < p.eatBelow || injuryMeal) && allowed.includes('eat') && hasFood && now >= this.quietUntil)
       return run({ type: 'eat' }, 40, 'eat');
     const index = intent.goal.steps.findIndex((_, i) => !this.completed.has(i));
     if (index < 0) {
@@ -664,7 +676,8 @@ export class MinecraftBody {
         const stopped = stoppedCode(details);
         this.encounter.unproductive ??= {};
         this.encounter.unproductive[reaction] = this.madeProgress(receipt) ? 0 : (this.encounter.unproductive[reaction] ?? 0) + 1;
-        const code = stopped === 'distance_limit' || stopped === 'authorization_exhausted' ? stopped
+        const code = stopped === 'distance_limit' || stopped === 'authorization_exhausted'
+          || reaction === 'flee' && ['retreat_blocked', 'no_retreat_direction'].includes(stopped ?? '') ? stopped
           : this.encounter.unproductive[reaction] >= MAX_UNPRODUCTIVE_ATTEMPTS ? 'repeated_no_progress' : undefined;
         if (code && !this.encounter.blocked?.[reaction]) {
           const blocked = { reaction, encounterId: this.encounter.id, intentVersion: currentVersion, receiptId: receipt.id, code };

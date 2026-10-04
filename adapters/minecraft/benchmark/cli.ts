@@ -4,7 +4,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawn } from 'node:child_process';
 import { prepareExamServer, loadExamServer } from './server.ts';
 import { VanillaExamAdapter } from './adapter.ts';
-import { STAGE_ONE_TASKS, STAGE_TWO_PLAN } from './tasks.ts';
+import { STAGE_ONE_TASKS, STAGE_TWO_PLAN, SURVIVAL_QUALIFICATION_TASKS } from './tasks.ts';
 import { captureExamSource, runSkillExam, summarizeExams } from './runner.ts';
 import type { ExamArchitecture, ExamCandidateMetadata, ExamExecutor, ExamResult } from './types.ts';
 
@@ -13,7 +13,8 @@ const args = process.argv.slice(2), command = args[0] || 'list';
 const option = (name: string, fallback?: string) => { const at = args.indexOf(`--${name}`); if (at === -1) return fallback; if (!args[at + 1] || args[at + 1].startsWith('--')) throw new Error(`Missing --${name} value.`); return args[at + 1]; };
 const output = join(root, 'var/minecraft/skill-exam/results');
 if (command === 'list') {
-  console.log(JSON.stringify({ stageOne: STAGE_ONE_TASKS.map(({ id, title, category, timeoutMs }) => ({ id, title, category, timeoutMs })), stageTwo: STAGE_TWO_PLAN }, null, 2));
+  console.log(JSON.stringify({ stageOne: STAGE_ONE_TASKS.map(({ id, title, category, timeoutMs }) => ({ id, title, category, timeoutMs })),
+    survivalQualifications: SURVIVAL_QUALIFICATION_TASKS.map(({ id, title, initialHealth, initialFood }) => ({ id, title, initialHealth, initialFood })), stageTwo: STAGE_TWO_PLAN }, null, 2));
 } else if (command === 'prepare') {
   const config = await prepareExamServer(root);
   console.log(JSON.stringify({ prepared: true, started: false, directory: config.directory, gamePort: config.gamePort, rconPort: config.rconPort }, null, 2));

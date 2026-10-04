@@ -16,6 +16,8 @@ export interface ExamTask {
   objective: { item?: string; count?: number; statistic?: string; minJumps?: number; maxPlaced?: number; requirePlacement?: boolean };
   perturbation?: { when: 'first-resource'; enemy: EnemySpec };
   initialFood?: { maximum: number };
+  /** Isolated, pre-scoring injury only; recovery buffs must be gone at baseline. */
+  initialHealth?: number;
 }
 
 /** Referee-only truth. Never add this object to an agent's observations. */

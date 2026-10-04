@@ -137,6 +137,9 @@ async function combat(bot: any, action: any, signal: AbortSignal, elapsed: () =>
         checkSignal(signal); bot.attack(fresh); lastAttacks.set(bot, now); details.attempts++;
       }
     } else {
+      // A blocked retreat may authorize fighting back in place, never a new
+      // chase. Knockback does not grant movement; wait for actual melee reach.
+      if (action.stance === 'hold') { bot.clearControlStates(); await tick(signal); continue; }
       if (bot.entity.position.distanceTo(origin) + .65 >= range) throw failure('pursuit_limit', '继续追近会越过本次授权范围。', details);
       const step = stepToward(bot, root.position);
       if (step) {

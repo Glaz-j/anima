@@ -52,6 +52,18 @@ test('combat tracks at a fast cadence while respecting held weapon cooldown acro
   assert.equal(meleeCooldownMs('wooden_axe'), 1250); assert.equal(meleeCooldownMs('iron_sword'), 625);
 });
 
+test('hold defense waits without pursuing and strikes only after the enemy enters reach', async () => {
+  const { bot } = fixture(); const target = enemy(bot, new Vec3(.5, 64, 6));
+  const movements: string[] = [];
+  bot.setControlState = (key: string, value: boolean) => { if (value) movements.push(key); };
+  bot.heldItem = { name: 'iron_sword' };
+  let ticks = 0;
+  bot.lookAt = async () => { if (++ticks === 3) target.position = new Vec3(.5, 64, 2.5); };
+  const result = await runContinuousSkill(bot, { type: 'combat', entityId: 10, stance: 'hold', durationMs: 260 }, signal());
+  assert.deepEqual(movements, []); assert.equal(bot.attacks.length, 1);
+  assert.equal(result.killConfirmed, false); assert.ok(result.controlTicks >= 3);
+});
+
 test('combat target disappearance is an observation, never invented kill evidence', async () => {
   const { bot } = fixture(); enemy(bot);
   bot.attack = () => { delete bot.entities[10]; };

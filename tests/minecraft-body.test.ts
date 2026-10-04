@@ -58,6 +58,76 @@ function fixture() {
   };
 }
 
+test('injury feeding uses safe food at hunger 17 without inventing consumption', async t => {
+  const f = fixture(); t.after(() => f.clean());
+  f.bot.health = 8; f.bot.food = 17; f.inventory([{ name: 'bread', count: 2 }]);
+  await f.submit([], { reactions: ['eat'] });
+  assert.equal(f.calls[0]?.action.type, 'eat');
+  assert.equal(f.bot.food, 17); assert.equal(f.bot.health, 8);
+});
+
+test('injury feeding respects disabled policy, full hunger and unsafe food', async t => {
+  for (const [health, food, item, policy] of [[20, 17, 'bread', {}], [8, 20, 'bread', {}],
+    [8, 17, 'rotten_flesh', {}], [8, 17, 'bread', { healBelow: 0 }]] as const) {
+    const f = fixture(); t.after(() => f.clean());
+    f.bot.health = health; f.bot.food = food; f.inventory([{ name: item, count: 2 }]);
+    await f.submit([], { reactions: ['eat'], policy });
+    assert.equal(f.calls.length, 0);
+  }
+});
+
+test('defense keeps a valid target when a second enemy becomes closer', async t => {
+  const f = fixture(); t.after(() => f.clean());
+  f.enemy(); await f.submit([], { reactions: ['defend', 'flee'] });
+  const second = f.enemy('zombie', 10); second.position = new Vec3(1, 64, 0);
+  const now = Date.now() + 300; t.mock.method(Date, 'now', () => now);
+  f.body.controller.tick(); await flush();
+  assert.equal(f.calls[0].signal.aborted, false); assert.equal(f.calls.length, 1);
+});
+
+for (const code of ['retreat_blocked', 'no_retreat_direction']) test(`blocked retreat ${code} immediately permits bounded hold defense`, async t => {
+  const f = fixture(); t.after(() => f.clean());
+  f.bot.health = 4; f.enemy(); await f.submit([], { reactions: ['flee', 'defend'] });
+  assert.equal(f.calls[0].action.type, 'retreat');
+  const origin = f.calls[0].action.origin;
+  await f.finish(0, { stoppedReason: code }, 'failed');
+  f.body.controller.tick(); await flush();
+  assert.equal(f.calls[1]?.action.type, 'combat'); assert.equal(f.calls[1].action.stance, 'hold');
+  assert.deepEqual(f.calls[1].action.origin, origin);
+  assert.equal(f.events.filter(e => e.type === 'goal-blocked').length, 1);
+});
+
+test('blocked retreat cannot create an unauthorized defense', async t => {
+  const f = fixture(); t.after(() => f.clean());
+  f.bot.health = 4; f.enemy(); await f.submit([], { reactions: ['flee'] });
+  await f.finish(0, { stoppedReason: 'retreat_blocked' }, 'failed');
+  f.body.controller.tick(); await flush();
+  assert.equal(f.calls.length, 1);
+});
+
+test('injury meal does not interrupt an authorized nearby fight', async t => {
+  const f = fixture(); t.after(() => f.clean()); f.bot.health = 8; f.bot.food = 17;
+  f.inventory([{ name: 'bread', count: 2 }]); f.enemy();
+  await f.submit([], { reactions: ['eat', 'defend'] });
+  assert.equal(f.calls[0].action.type, 'combat');
+});
+
+test('a new creeper overrides retained zombie defense and cancellation drains first', async t => {
+  let now = Date.now(); t.mock.method(Date, 'now', () => now);
+  const f = fixture(); t.after(() => f.clean()); f.enemy();
+  await f.submit([], { reactions: ['defend', 'flee'] });
+  f.enemy('creeper', 10).position = new Vec3(4, 64, 0); now += 300;
+  f.body.controller.tick(); await flush();
+  assert.equal(f.calls[0].signal.aborted, true); assert.equal(f.calls.length, 1);
+  await f.finish(0, {}, 'cancelled'); f.body.controller.tick(); await flush();
+  assert.equal(f.calls[1].action.type, 'retreat'); assert.equal(f.calls[1].action.entityId, 10);
+});
+
+test('combat stance validates and preserves explicit hold authorization', () => {
+  assert.equal(validateBodyAction({ type: 'combat', entityId: 9, stance: 'hold' }).stance, 'hold');
+  assert.throws(() => validateBodyAction({ type: 'combat', entityId: 9, stance: 'teleport' }), /姿态/u);
+});
+
 test('a rejected work route waits for a new decision across backoff and identical renewal', async t => {
   const f = fixture(); t.after(() => f.clean());
   const steps = [{ type: 'look', x: 1, y: 65, z: 0 }, { type: 'jump_to', x: 2, y: 65, z: 0 }, { type: 'wait', ms: 100 }];

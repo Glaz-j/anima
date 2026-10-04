@@ -36,6 +36,42 @@ test('stage one covers all requested skills in independent versioned cases', () 
   for (const task of STAGE_ONE_TASKS) { assert.equal(task.stage, 1); assert.ok(task.required.includes('server-statistics')); assert.ok(task.timeoutMs > 0); }
   const copy = getExamTask('gather-01'); copy.inventory[0].count = 99; assert.equal(getExamTask('gather-01').inventory[0].count, 1);
 });
+
+test('survival qualifications enforce declared injury and retain the frozen stage-one gate', () => {
+  const task = getExamTask('survival-corner-01'), initial = evidence(task);
+  assert.equal(STAGE_ONE_TASKS.length, 10); assert.equal(task.initialHealth, 8);
+  assert.throws(() => new SkillExamReferee(task, initial), /declared health/u);
+  initial.actor.health = 8;
+  const referee = new SkillExamReferee(task, initial), next = advance(initial);
+  next.enemies[0].alive = false;
+  assert.equal(referee.update(next).status, 'running', 'A missing enemy still does not prove a player kill.');
+  next.statistics.killed_zombie = 1;
+  assert.equal(referee.update(advance(next)).status, 'passed');
+});
+
+test('injured arena setup damages only before baseline and opponent activation', async () => {
+  const task = getExamTask('survival-corner-01'), initial = evidence(task), calls: string[] = [];
+  initial.actor.health = 8; let health = 20;
+  const adapter = new VanillaExamAdapter({ kind: 'anima-skill-exam', gamePort: 25575, rconPort: 25585 } as any);
+  (adapter as any).connected = true;
+  (adapter as any).rcon = { command: async (command: string) => {
+    calls.push(command); if (command.startsWith('damage ')) health = 8;
+    return command === 'list' ? 'There are 1 of a max of 2 players online: ExamBot'
+      : command === 'data get entity ExamBot' ? setupNbt(task, { Health: health }) : 'ok';
+  } };
+  adapter.sample = async () => { calls.push('INITIAL_SNAPSHOT'); return initial; };
+  await adapter.prepare(task, 'ExamBot', new AbortController().signal);
+  const damage = calls.indexOf('damage ExamBot 12 minecraft:generic'), baseline = calls.indexOf('INITIAL_SNAPSHOT');
+  assert.ok(damage >= 0 && damage < baseline);
+  assert.ok(calls.findIndex(c => c.includes('NoAI:0b')) > baseline);
+  assert.equal(calls.filter(c => c.startsWith('damage ')).length, 1);
+});
+
+test('invalid injury setup is rejected before an arena connection', async () => {
+  const adapter = new VanillaExamAdapter({ kind: 'anima-skill-exam', gamePort: 25575, rconPort: 25585 } as any);
+  for (const initialHealth of [0, 21, 1.5, NaN])
+    await assert.rejects(adapter.prepare({ ...getExamTask('survival-corner-01'), initialHealth }, 'ExamBot', new AbortController().signal), /Invalid initial health/u);
+});
 test('parkour courses have tall side walls so walking around a gap cannot substitute for the task', () => {
   for (const id of ['parkour-empty-01', 'parkour-items-01']) {
     const task = getExamTask(id);

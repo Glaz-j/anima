@@ -50,6 +50,8 @@ export class VanillaExamAdapter implements ExamAdapter {
     signal?.throwIfAborted(); const response = await this.rcon.command(command); signal?.throwIfAborted(); return checked(response, command);
   }
   async prepare(task: ExamTask, actor: string, signal: AbortSignal): Promise<ServerEvidence> {
+    if (task.initialHealth !== undefined && (!Number.isInteger(task.initialHealth) || task.initialHealth < 1 || task.initialHealth > 20))
+      throw new Error('Invalid initial health (integer 1–20 required).');
     if (!/^[A-Za-z0-9_]{1,16}$/u.test(actor)) throw new Error('Invalid actor.');
     if (this.prepared) throw new Error('Clean up the previous exam before preparing another.');
     if (!this.connected) { await this.rcon.connect(this.config.rconPort, this.config.rconPassword); this.connected = true; }
@@ -91,13 +93,13 @@ export class VanillaExamAdapter implements ExamAdapter {
     return initial;
   }
   private async establishBaseline(task: ExamTask, signal: AbortSignal): Promise<ServerEvidence> {
-    const actor = this.actor, deadline = Date.now() + 20_000;
+    const actor = this.actor, deadline = Date.now() + 20_000, expectedHealth = task.initialHealth ?? 20;
     const read = async () => compound(await this.command(`data get entity ${actor}`, signal));
     const health = (nbt: any) => numberField(nbt.Health, 'Health');
     const food = (nbt: any) => numberField(nbt.foodLevel, 'foodLevel');
     const isTrue = (value: any) => value === true || value === 1;
     const problem = (nbt: any): string | undefined => {
-      if (health(nbt) !== 20) return `health=${health(nbt)}`;
+      if (health(nbt) !== expectedHealth) return `health=${health(nbt)}`;
       if (task.initialFood ? food(nbt) <= 0 || food(nbt) > task.initialFood.maximum : food(nbt) !== 20) return `food=${food(nbt)}`;
       if (numberField(nbt.playerGameType, 'playerGameType') !== 0) return 'not survival';
       if (!nbt.abilities || ['invulnerable', 'flying', 'mayfly'].some(key => isTrue(nbt.abilities[key]))) return 'creative abilities remain';
@@ -144,6 +146,8 @@ export class VanillaExamAdapter implements ExamAdapter {
           } finally { await this.rcon.command(`effect clear ${actor} minecraft:hunger`); }
           if (!hungry) { lastProblem = 'healthy hunger precondition not confirmed'; continue; }
         }
+        if (expectedHealth < 20)
+          await this.command(`damage ${actor} ${20 - expectedHealth} minecraft:generic`, signal);
         // Observe an unbuffed stable interval, rather than treating a sleep or
         // the effect command's acknowledgement as proof of a fair baseline.
         const settleUntil = Math.min(deadline, Date.now() + 3000);
@@ -152,7 +156,7 @@ export class VanillaExamAdapter implements ExamAdapter {
           const nbt = await read(), issue = problem(nbt);
           if (issue) {
             lastProblem = issue; stableSince = undefined;
-            if (health(nbt) !== 20 || food(nbt) <= 0) break;
+            if (health(nbt) !== expectedHealth || food(nbt) <= 0) break;
           } else {
             stableSince ??= Date.now();
             if (Date.now() - stableSince >= 500) {
@@ -160,7 +164,7 @@ export class VanillaExamAdapter implements ExamAdapter {
               // Sampling scores/entities takes several round trips. A delayed
               // movement packet must not cause an injury behind that snapshot.
               const after = await read(), afterIssue = problem(after);
-              if (!afterIssue && initial.actor.health === 20
+              if (!afterIssue && initial.actor.health === expectedHealth
                 && (task.initialFood ? initial.actor.food > 0 && initial.actor.food <= task.initialFood.maximum : initial.actor.food === 20)) return initial;
               lastProblem = afterIssue || 'full evidence disagrees with stable baseline'; break;
             }

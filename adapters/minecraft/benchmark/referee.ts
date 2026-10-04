@@ -15,7 +15,10 @@ export class SkillExamReferee {
     this.task = task; this.initial = structuredClone(initial); this.latest = initial;
     this.validate(initial);
     if (task.initialFood && initial.actor.food > task.initialFood.maximum) throw new EvidenceError('Hunger precondition was not established.');
-    if (initial.actor.health !== 20) throw new EvidenceError('Actor must begin at full health (20).');
+    const expectedHealth = task.initialHealth ?? 20;
+    if (!Number.isInteger(expectedHealth) || expectedHealth < 1 || expectedHealth > 20 || initial.actor.health !== expectedHealth)
+      throw new EvidenceError(expectedHealth === 20 ? 'Actor must begin at full health (20).'
+        : `Actor must begin at the declared health (${expectedHealth}).`);
     if (task.enemies.some(expected => !initial.enemies.some(actual => actual.tag === expected.tag && actual.type === expected.type && actual.alive && Number(actual.health) > 0))) {
       throw new EvidenceError('Specified enemies were not observed alive before dispatch.');
     }

@@ -39,7 +39,8 @@ export async function createExamExecutor(options: { root: string; host: string; 
         const state = body.snapshot();
         const result = body.submit({ expectedVersion: state.version, steps,
           reactions: !options.architecture || options.architecture === 'dual' ? reactions : [], ttlMs: 240000,
-          label: context.instruction, policy: { threatRange: 7, chaseRange: 12, retreatHealth: 5 } }, state.stopped);
+          label: context.instruction, policy: { threatRange: 7, chaseRange: 12,
+            retreatHealth: Number(/撤退阈值(\d+)/u.exec(context.instruction)?.[1] ?? 5) } }, state.stopped);
         if (!result.accepted) throw new Error(`Body rejected goal: ${result.reason}`);
         return result;
       };

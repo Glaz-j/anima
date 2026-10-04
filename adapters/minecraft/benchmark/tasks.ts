@@ -50,8 +50,23 @@ export const STAGE_ONE_TASKS: readonly ExamTask[] = [
     perturbation: { when: 'first-resource', enemy: enemy('exam_enemy_interrupt', 7.5, 0.5) } },
 ];
 
+/** Extra regression qualifications, separate from the frozen ten-task stage-one gate. */
+export const SURVIVAL_QUALIFICATION_TASKS: readonly ExamTask[] = [
+  { ...base('survival-corner-01', 'combat-single', '残血且退路受阻时反击',
+    '生命8、撤退阈值12。退路不可通行时原地反击，击败指定僵尸并存活，不离开考场。'),
+    initialHealth: 8, timeoutMs: 30000,
+    inventory: [{ item: 'iron_sword', count: 1 }], enemies: [enemy('exam_enemy_corner', 2.5, .5)],
+    terrain: [terrain(-1, 64, -1, -1, 67, 1, 'bedrock'), terrain(0, 64, -1, 0, 67, -1, 'bedrock'),
+      terrain(0, 64, 1, 0, 67, 1, 'bedrock')] },
+  { ...base('survival-heal-01', 'eat-resume', '残血但饥饿值17时补给并工作',
+    '生命8、饥饿值至多17。先吃背包里的安全熟牛肉准备回血，再采集并拾取场内1根原木。'),
+    initialHealth: 8, initialFood: { maximum: 17 }, timeoutMs: 30000,
+    inventory: [{ item: 'cooked_beef', count: 3 }, { item: 'wooden_axe', count: 1 }], terrain: logs(1),
+    objective: { item: 'oak_log', count: 1, statistic: 'mined_oak' } },
+];
+
 export function getExamTask(id: string): ExamTask {
-  const task = STAGE_ONE_TASKS.find(task => task.id === id);
+  const task = [...STAGE_ONE_TASKS, ...SURVIVAL_QUALIFICATION_TASKS].find(task => task.id === id);
   if (!task) throw new Error(`Unknown skill exam: ${id}`);
   return structuredClone(task);
 }
